@@ -434,51 +434,8 @@ class NostrAdapter(BasePlatformAdapter):
         return content
 
     # ------------------------------------------------------------------
-    # Standalone sender (for cron delivery outside the gateway)
+    # Plugin registration
     # ------------------------------------------------------------------
-
-    async def _standalone_send(self, chat_id: str, message: str,
-                                **kwargs) -> dict:
-        """Send a message without a running gateway (for cron jobs)."""
-        try:
-            nsec = os.getenv("NOSTR_NSEC", "")
-            if not nsec:
-                return {"error": "NOSTR_NSEC not set"}
-
-            relays_raw = os.getenv("NOSTR_RELAYS", "")
-            relay_urls = [
-                r.strip() for r in relays_raw.split(",") if r.strip()
-            ]
-            if not relay_urls:
-                return {"error": "NOSTR_RELAYS not set"}
-
-            # Convert npub chat_id to hex if needed
-            recipient = chat_id
-            if recipient.startswith("npub1"):
-                recipient = _npub_to_hex(recipient)
-
-            # Create a temporary relay pool
-            pool = RelayPool(relay_urls)
-            await pool.connect()
-
-            # Create and send DM
-            rumor = create_dm_rumor(message, recipient)
-            gift_event = create_gift_wrap(rumor, recipient, nsec)
-            await pool.publish(gift_event)
-
-            await pool.disconnect()
-
-            return {
-                "success": True,
-                "message_id": gift_event.get("id"),
-            }
-        except Exception as e:
-            return {"error": f"Nostr standalone send failed: {e}"}
-
-
-# ---------------------------------------------------------------------------
-# Plugin registration
-# ---------------------------------------------------------------------------
 
 def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
@@ -522,10 +479,10 @@ async def _standalone_send_async(chat_id: str, message: str, **kwargs) -> dict:
 
         rumor = create_dm_rumor(message, recipient)
         gift_event = create_gift_wrap(rumor, recipient, nsec)
-        await pool.publish(gift_event)
-
-        await pool.disconnect()
-
-        return {"success": True, "message_id": gift_event.get("id")}
+        try:
+            await pool.publish(gift_event)
+            return {"success": True, "message_id": gift_event.get("id")}
+        finally:
+            await pool.disconnect()
     except Exception as e:
         return {"error": f"Nostr standalone send failed: {e}"}

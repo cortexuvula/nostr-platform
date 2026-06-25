@@ -443,7 +443,7 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     recipient_pubkey = recipient_privkey.public_key.hex()
 
     # Check p tag matches our pubkey
-    p_tags = [t for t in gift_event.get("tags", []) if t[0] == "p"]
+    p_tags = [t for t in gift_event.get("tags", []) if isinstance(t, list) and len(t) >= 2 and t[0] == "p"]
     if not any(t[1] == recipient_pubkey for t in p_tags):
         return None
 
@@ -475,6 +475,15 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     if not seal_pubkey:
         return None
 
+    # Step 4: Verify seal signature
+    try:
+        seal_event = Event.from_dict(seal)
+        if not seal_event.verify():
+            logger.debug("Seal signature verification failed")
+            return None
+    except Exception:
+        return None
+
     # Step 5: NIP-44 decrypt the rumor from seal content
     try:
         rumor_json = nip44_decrypt(
@@ -501,4 +510,5 @@ def create_dm_rumor(content: str, recipient_pubkey_hex: str) -> dict:
         "kind": 14,
         "content": content,
         "tags": [["p", recipient_pubkey_hex]],
+        "created_at": 0,
     }

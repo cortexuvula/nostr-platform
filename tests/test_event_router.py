@@ -53,7 +53,7 @@ class TestEventClassification:
 
         mock_adapter._handle_dm.assert_called_once()
         args = mock_adapter._handle_dm.call_args
-        assert "test message" in args[0]
+        assert args[0][1] == "test message"  # (sender_pubkey, content, event)
 
     async def test_kind_1_with_mention_routed(self, mock_adapter, keypair):
         """Kind 1 with p tag matching our pubkey should trigger mention handler."""
