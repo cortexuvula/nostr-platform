@@ -2,27 +2,39 @@
 Nostr cryptographic operations: NIP-44 v2 encryption, NIP-04 legacy DM,
 event signing, gift-wrap unwrap/create, and key utilities.
 
-Uses pynostr for event signing/bech32 and coincurve + cryptography
-for NIP-44 v2 (pynostr 0.7 doesn't ship a nip44 module).
+NIP-44 v2 spec: https://github.com/nostr-protocol/nips/blob/master/44.md
+Uses pynostr for event signing/bech32 and the cryptography package for
+ChaCha20 + HKDF + HMAC-SHA256.
 
 Security: the nsec is never logged. It is passed as a private variable
 and used only for cryptographic operations.
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import struct
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.backends import default_backend
 from pynostr.event import Event
-from pynostr.key import PrivateKey
+from pynostr.key import PrivateKey, PublicKey
 
 logger = logging.getLogger(__name__)
+
+NIP44_VERSION = 0x02
+MIN_PLAINTEXT_SIZE = 1
+MAX_PLAINTEXT_SIZE = 65535
+MIN_PAYLOAD_SIZE = 99  # 1 + 32 + 32 + 32 (version + nonce + min ciphertext + mac)
+MAX_PAYLOAD_SIZE = 65603
+
 
 # ---------------------------------------------------------------------------
 # Key utilities
@@ -36,21 +48,16 @@ def derive_pubkey(nsec: str) -> str:
 
 def npub_to_hex(npub: str) -> str:
     """Convert npub (bech32) to hex pubkey."""
-    pk = PrivateKey.from_nsec  # not for npub
-    # pynostr PublicKey can decode npub
-    from pynostr.key import PublicKey
     return PublicKey.from_npub(npub).hex()
 
 
 def hex_to_npub(hex_key: str) -> str:
     """Convert hex pubkey to npub (bech32)."""
-    from pynostr.key import PublicKey
     return PublicKey.from_hex(hex_key).bech32()
 
 
 # ---------------------------------------------------------------------------
-# NIP-44 v2 encryption / decryption
-# Based on https://github.com/nostr-protocol/nips/blob/master/44.md
+# HKDF (RFC 5869) with SHA-256
 # ---------------------------------------------------------------------------
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -60,7 +67,7 @@ def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
     return hmac.new(salt, ikm, hashlib.sha256).digest()
 
 
-def _hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
     """HKDF-Expand using HMAC-SHA256."""
     t = b""
     okm = b""
@@ -70,85 +77,146 @@ def _hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
     return okm[:length]
 
 
-def _get_shared_secret(privkey_hex: str, pubkey_hex: str) -> bytes:
-    """Compute ECDH shared secret (raw X coordinate) using secp256k1.
+# ---------------------------------------------------------------------------
+# ECDH shared secret
+# ---------------------------------------------------------------------------
 
-    Uses pynostr's PrivateKey.compute_shared_secret which returns the raw
-    X coordinate of the shared point — per NIP-44/NIP-04 spec.
+def _get_shared_secret(privkey_hex: str, pubkey_hex: str) -> bytes:
+    """Compute ECDH shared secret (raw unhashed X coordinate) using secp256k1.
+
+    Per NIP-44 spec: "Output of ECDH is the unhashed 32-byte x-coordinate."
+    Uses pynostr's PrivateKey.compute_shared_secret which returns raw X.
     """
     sk = PrivateKey(bytes.fromhex(privkey_hex))
     return sk.compute_shared_secret(pubkey_hex)
 
 
-def _get_message_keys(privkey_hex: str, pubkey_hex: str,
-                      conversation_key: Optional[bytes] = None) -> tuple:
-    """Derive encryption keys from the shared secret.
+def _get_conversation_key(privkey_hex: str, pubkey_hex: str) -> bytes:
+    """NIP-44: conversation_key = HKDF-Extract(IKM=shared_x, salt='nip44-v2')."""
+    shared_x = _get_shared_secret(privkey_hex, pubkey_hex)
+    return _hkdf_extract(b"nip44-v2", shared_x)
 
-    Returns (conversation_key, salt, encryption_key, nonce).
+
+def _get_message_keys(conversation_key: bytes, nonce: bytes) -> tuple:
+    """NIP-44: derive per-message keys from conversation_key and nonce.
+
+    Returns (chacha_key, chacha_nonce, hmac_key).
     """
-    if conversation_key is None:
-        conversation_key = _get_shared_secret(privkey_hex, pubkey_hex)
+    keys = _hkdf_expand(conversation_key, nonce, 76)
+    chacha_key = keys[0:32]
+    chacha_nonce = keys[32:44]
+    hmac_key = keys[44:76]
+    return chacha_key, chacha_nonce, hmac_key
 
-    # Generate random salt (32 bytes)
-    salt = os.urandom(32)
 
-    # HKDF: extract then expand
-    prk = _hkdf_extract(salt, conversation_key)
+# ---------------------------------------------------------------------------
+# NIP-44 v2 padding
+# ---------------------------------------------------------------------------
 
-    # Expand to get encryption key (32) + nonce (12)
-    info = b"nip44-v2"
-    expanded = _hkdf_expand(prk, info, 44)
-    encryption_key = expanded[:32]
-    nonce = expanded[32:44]
+def _calc_padded_len(unpadded_len: int) -> int:
+    """NIP-44 v2 padding size calculation per spec."""
+    if unpadded_len <= 32:
+        return 32
+    next_power = 1 << (math.floor(math.log2(unpadded_len - 1)) + 1)
+    chunk = 32 if next_power <= 256 else next_power // 8
+    return chunk * (math.floor((unpadded_len - 1) / chunk) + 1)
 
-    return conversation_key, salt, encryption_key, nonce
 
+def _pad(plaintext: bytes) -> bytes:
+    """NIP-44 v2 pad: [u16 BE length][plaintext][zero padding]."""
+    unpadded_len = len(plaintext)
+    if unpadded_len < MIN_PLAINTEXT_SIZE:
+        raise ValueError("Plaintext too short")
+    if unpadded_len > MAX_PLAINTEXT_SIZE:
+        raise ValueError("Plaintext too long")
+
+    padded_len = _calc_padded_len(unpadded_len)
+    result = struct.pack(">H", unpadded_len) + plaintext
+    padding_needed = padded_len + 2 - len(result)  # +2 for length prefix
+    if padding_needed > 0:
+        result += b"\x00" * padding_needed
+    return result
+
+
+def _unpad(padded: bytes) -> bytes:
+    """NIP-44 v2 unpad: read u16 BE length, slice, verify zeros."""
+    if len(padded) < 2:
+        raise ValueError("Padded data too short")
+    unpadded_len = struct.unpack(">H", padded[:2])[0]
+    if unpadded_len < MIN_PLAINTEXT_SIZE or unpadded_len > MAX_PLAINTEXT_SIZE:
+        raise ValueError("Invalid plaintext length in padding")
+    plaintext = padded[2:2 + unpadded_len]
+    if len(plaintext) != unpadded_len:
+        raise ValueError("Padded data shorter than declared length")
+    # Verify padding bytes are zeros
+    padding = padded[2 + unpadded_len:]
+    if any(b != 0 for b in padding):
+        raise ValueError("Invalid padding bytes (non-zero)")
+    # Verify padded length matches expected
+    expected_padded = _calc_padded_len(unpadded_len)
+    if len(padded) - 2 != expected_padded:
+        raise ValueError("Padded length doesn't match expected size")
+    return plaintext
+
+
+# ---------------------------------------------------------------------------
+# ChaCha20
+# ---------------------------------------------------------------------------
+
+def _chacha20_encrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    """ChaCha20 encryption (RFC 8439, counter=0).
+
+    The cryptography library expects a 16-byte nonce. NIP-44 derives a
+    12-byte nonce from HKDF. Per RFC 8439, the ChaCha20 nonce is 12 bytes,
+    so we pad to 16 bytes by prepending 4 zero bytes (the counter prefix).
+    """
+    padded_nonce = b"\x00\x00\x00\x00" + nonce  # 4-byte counter prefix + 12-byte nonce
+    cipher = Cipher(
+        algorithms.ChaCha20(key, padded_nonce),
+        mode=None,
+        backend=default_backend(),
+    )
+    encryptor = cipher.encryptor()
+    return encryptor.update(data) + encryptor.finalize()
+
+
+def _chacha20_decrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    """ChaCha20 decryption (same as encryption — symmetric stream cipher)."""
+    return _chacha20_encrypt(key, nonce, data)
+
+
+# ---------------------------------------------------------------------------
+# NIP-44 v2 encrypt / decrypt
+# ---------------------------------------------------------------------------
 
 def nip44_encrypt(plaintext: str, sender_privkey_hex: str,
                   recipient_pubkey_hex: str) -> str:
     """NIP-44 v2 encrypt.
 
-    Returns base64-encoded payload: version (1 byte) + salt (32) + nonce (12) +
-    ciphertext + mac (32).
-
-    NOTE: NIP-44 v2 uses a slightly different key derivation than what we have
-    here. For full spec compliance, see the reference implementation. This
-    implementation follows the spec at https://github.com/nostr-protocol/nips/blob/master/44.md
+    Returns base64-encoded payload: version(1) + nonce(32) + ciphertext + mac(32).
     """
-    conversation_key = _get_shared_secret(sender_privkey_hex, recipient_pubkey_hex)
-    salt = os.urandom(32)
+    # 1. Calculate conversation key
+    conversation_key = _get_conversation_key(sender_privkey_hex, recipient_pubkey_hex)
 
-    # HKDF
-    prk = _hkdf_extract(salt, conversation_key)
-    info = b"nip44-v2"
-    enc_key = _hkdf_expand(prk, info, 32)
-    nonce = _hkdf_expand(prk, info + b"\x01", 12)  # Different info for nonce
+    # 2. Generate random 32-byte nonce
+    nonce = os.urandom(32)
 
-    # Actually, per spec: keys = HKDF(salt, conversation_key, info="nip44-v2", length=44)
-    # enc_key = keys[0:32], nonce = keys[32:44]
-    keys = _hkdf_expand(prk, info, 44)
-    enc_key = keys[:32]
-    nonce = keys[32:44]
+    # 3. Derive message keys
+    chacha_key, chacha_nonce, hmac_key = _get_message_keys(conversation_key, nonce)
 
-    # Pad plaintext
-    plaintext_bytes = plaintext.encode("utf-8")
-    padded = _pad(plaintext_bytes)
+    # 4. Pad plaintext
+    padded = _pad(plaintext.encode("utf-8"))
 
-    # Encrypt with AES-256-GCM
-    aesgcm = AESGCM(enc_key)
-    ciphertext = aesgcm.encrypt(nonce, padded, None)
+    # 5. Encrypt with ChaCha20
+    ciphertext = _chacha20_encrypt(chacha_key, chacha_nonce, padded)
 
-    # Build payload: version + salt + nonce + ciphertext
-    payload = bytes([2]) + salt + nonce + ciphertext  # version 2 = NIP-44 v2
+    # 6. Calculate MAC: HMAC-SHA256(hmac_key, nonce + ciphertext)
+    mac = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
 
-    # MAC over the payload (HMAC-SHA256 of payload with mac key)
-    mac_key = _hkdf_expand(prk, b"nip44-v2-mac", 32)
-    mac = hmac.new(mac_key, payload, hashlib.sha256).digest()
+    # 7. Encode: version + nonce + ciphertext + mac
+    payload = bytes([NIP44_VERSION]) + nonce + ciphertext + mac
 
-    payload_with_mac = payload + mac
-
-    import base64
-    return base64.b64encode(payload_with_mac).decode("ascii")
+    return base64.b64encode(payload).decode("ascii")
 
 
 def nip44_decrypt(payload_b64: str, recipient_privkey_hex: str,
@@ -157,91 +225,36 @@ def nip44_decrypt(payload_b64: str, recipient_privkey_hex: str,
 
     Returns the plaintext string.
     """
-    import base64
-
+    # 2. Decode base64 and validate size
     payload = base64.b64decode(payload_b64)
+    if len(payload) < MIN_PAYLOAD_SIZE or len(payload) > MAX_PAYLOAD_SIZE:
+        raise ValueError(f"Invalid NIP-44 payload length: {len(payload)}")
 
+    # 3. Parse payload
     version = payload[0]
-    if version != 2:
+    if version != NIP44_VERSION:
         raise ValueError(f"Unsupported NIP-44 version: {version}")
 
-    salt = payload[1:33]
-    nonce = payload[33:45]
-    ciphertext = payload[45:-32]
+    nonce = payload[1:33]
     mac = payload[-32:]
+    ciphertext = payload[33:-32]
 
-    # Compute conversation key
-    conversation_key = _get_shared_secret(recipient_privkey_hex, sender_pubkey_hex)
+    # 4. Calculate conversation key and message keys
+    conversation_key = _get_conversation_key(recipient_privkey_hex, sender_pubkey_hex)
+    chacha_key, chacha_nonce, hmac_key = _get_message_keys(conversation_key, nonce)
 
-    # Derive keys
-    prk = _hkdf_extract(salt, conversation_key)
-    keys = _hkdf_expand(prk, b"nip44-v2", 44)
-    enc_key = keys[:32]
-    expected_nonce = keys[32:44]
-
-    # Verify MAC
-    mac_key = _hkdf_expand(prk, b"nip44-v2-mac", 32)
-    expected_mac = hmac.new(mac_key, payload[:-32], hashlib.sha256).digest()
+    # 5. Verify MAC (constant-time)
+    expected_mac = hmac.new(hmac_key, nonce + ciphertext, hashlib.sha256).digest()
     if not hmac.compare_digest(mac, expected_mac):
         raise ValueError("NIP-44 MAC verification failed")
 
-    # Decrypt
-    aesgcm = AESGCM(enc_key)
-    padded = aesgcm.decrypt(nonce, ciphertext, None)
+    # 6. Decrypt with ChaCha20
+    padded = _chacha20_decrypt(chacha_key, chacha_nonce, ciphertext)
 
-    # Unpad
+    # 7. Remove padding
     plaintext_bytes = _unpad(padded)
 
     return plaintext_bytes.decode("utf-8")
-
-
-def _pad(plaintext: bytes) -> bytes:
-    """NIP-44 v2 padding scheme.
-
-    Pads to next power-of-2 minus 1, with a 2-byte big-endian length prefix.
-    """
-    # NIP-44 v2 padding: https://github.com/nostr-protocol/nips/blob/master/44.md#v2
-    # pad to next power of 2 minus 1, with 2-byte length prefix
-    unpadded_len = len(plaintext)
-    if unpadded_len < 1:
-        raise ValueError("Plaintext too short")
-
-    # Calculate padded size
-    # NIP-44 v2: pad to next power of 2 minus 1, between 32 and 40960
-    if unpadded_len <= 32:
-        padded_size = 32
-    else:
-        # Next power of 2 minus 1
-        import math
-        next_pow2 = 1 << (unpadded_len - 1).bit_length()
-        padded_size = next_pow2 - 1
-        if padded_size < 32:
-            padded_size = 32
-
-    # Actually, NIP-44 v2 uses a specific padding table. Let me use the spec:
-    # size = max(32, next_pow2 - 1) where next_pow2 is the smallest power of 2 > len
-    # But also cap at 40960
-    if unpadded_len > 40960:
-        raise ValueError("Plaintext too long for NIP-44 v2 (max 40960 bytes)")
-
-    # From the spec: pad_size = max(32, (1 << (len-1).bit_length()) - 1)
-    # but simpler: use a simple scheme
-    pad_target = max(32, (1 << (unpadded_len - 1).bit_length()) - 1) if unpadded_len > 1 else 32
-    if pad_target > 40960:
-        pad_target = 40960
-
-    # Length prefix (2 bytes big-endian) + plaintext + zero padding
-    result = struct.pack(">H", unpadded_len) + plaintext
-    padding_needed = pad_target + 2 - len(result)  # +2 for length prefix
-    if padding_needed > 0:
-        result += b"\x00" * padding_needed
-    return result
-
-
-def _unpad(padded: bytes) -> bytes:
-    """Remove NIP-44 v2 padding."""
-    unpadded_len = struct.unpack(">H", padded[:2])[0]
-    return padded[2:2 + unpadded_len]
 
 
 # ---------------------------------------------------------------------------
@@ -254,12 +267,7 @@ def nip04_encrypt(plaintext: str, sender_privkey_hex: str,
 
     Returns base64-encoded ciphertext?iv format.
     """
-    import base64
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives import padding as sym_padding
-    from cryptography.hazmat.backends import default_backend
-
-    # ECDH shared secret (raw X coordinate — pynostr convention, no sha256)
+    # ECDH shared secret (raw X coordinate)
     shared = _get_shared_secret(sender_privkey_hex, recipient_pubkey_hex)
     key = shared  # pynostr uses raw X directly as AES key
 
@@ -284,12 +292,6 @@ def nip04_decrypt(payload: str, recipient_privkey_hex: str,
 
     Payload format: base64(ciphertext)?iv=base64(iv)
     """
-    import base64
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives import padding as sym_padding
-    from cryptography.hazmat.backends import default_backend
-
-    # Parse payload
     if "?iv=" not in payload:
         raise ValueError("Invalid NIP-04 payload: missing iv")
 
@@ -297,7 +299,7 @@ def nip04_decrypt(payload: str, recipient_privkey_hex: str,
     ciphertext = base64.b64decode(ct_b64)
     iv = base64.b64decode(iv_b64)
 
-    # ECDH shared secret (raw X coordinate — pynostr convention, no sha256)
+    # ECDH shared secret (raw X coordinate)
     shared = _get_shared_secret(recipient_privkey_hex, sender_pubkey_hex)
     key = shared  # pynostr uses raw X directly as AES key
 
@@ -328,17 +330,7 @@ class EventSigner:
 
     def sign_event(self, kind: int, content: str,
                    tags: list = None, created_at: int = None) -> dict:
-        """Create, sign, and return a Nostr event dict.
-
-        Args:
-            kind: Event kind (1, 4, 13, 1059, etc.)
-            content: Event content
-            tags: Event tags list
-            created_at: Unix timestamp (default: now)
-
-        Returns:
-            Signed event dict with id, pubkey, created_at, kind, tags, content, sig
-        """
+        """Create, sign, and return a Nostr event dict."""
         if tags is None:
             tags = []
         if created_at is None:
@@ -370,11 +362,12 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
                      sender_nsec: str) -> dict:
     """Create a NIP-17 gift-wrapped event (kind 1059).
 
-    Steps:
-    1. Seal the rumor: sign as kind 13 event with sender's key
-    2. Generate ephemeral keypair for the gift-wrap
-    3. Gift-wrap: encrypt the seal to recipient using NIP-44 with ephemeral key
-    4. Create kind 1059 event signed with ephemeral key
+    Steps (per NIP-17/NIP-59):
+    1. NIP-44 encrypt the rumor to recipient using sender's key → sealed content
+    2. Create seal (kind 13) event with encrypted content, signed by sender
+    3. Generate ephemeral keypair
+    4. NIP-44 encrypt the seal to recipient using ephemeral key → gift-wrap content
+    5. Create gift-wrap (kind 1059) event signed with ephemeral key
 
     Args:
         rumor: The inner rumor dict {kind, content, tags}
@@ -384,30 +377,36 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
     Returns:
         Signed kind 1059 event dict ready to publish
     """
-    signer = EventSigner(sender_nsec)
+    sender_signer = EventSigner(sender_nsec)
+    sender_privkey_hex = sender_signer._privkey_hex
 
-    # Step 1: Create seal (kind 13) — the rumor, signed by sender
-    seal_content = json.dumps(rumor)
-    seal = signer.sign_event(
+    # Step 1: NIP-44 encrypt the rumor to recipient
+    encrypted_rumor = nip44_encrypt(
+        json.dumps(rumor),
+        sender_privkey_hex,
+        recipient_pubkey_hex,
+    )
+
+    # Step 2: Create seal (kind 13) with encrypted content, signed by sender
+    seal = sender_signer.sign_event(
         kind=13,
-        content=seal_content,
+        content=encrypted_rumor,
         tags=[],
     )
 
-    # Step 2: Generate ephemeral keypair
+    # Step 3: Generate ephemeral keypair
     ephemeral_key = PrivateKey()
     ephemeral_privkey_hex = ephemeral_key.hex()
 
-    # Step 3: Encrypt the seal to recipient using NIP-44 with ephemeral key
+    # Step 4: NIP-44 encrypt the seal to recipient using ephemeral key
     encrypted_seal = nip44_encrypt(
         json.dumps(seal),
         ephemeral_privkey_hex,
         recipient_pubkey_hex,
     )
 
-    # Step 4: Create gift-wrap (kind 1059) signed with ephemeral key
+    # Step 5: Create gift-wrap (kind 1059) signed with ephemeral key
     ephemeral_signer = EventSigner(ephemeral_key.bech32())
-
     gift_wrap = ephemeral_signer.sign_event(
         kind=1059,
         content=encrypted_seal,
@@ -417,44 +416,42 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
     return gift_wrap
 
 
-def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[dict]:
+def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     """Unwrap a NIP-17 gift-wrapped event (kind 1059).
 
     Steps:
-    1. Check event is kind 1059 and has p tag matching our pubkey
-    2. Decrypt the content using NIP-44 (our privkey × sender's pubkey)
-    3. Parse the seal (kind 13 event)
-    4. Verify the seal's signature
-    5. Parse the rumor from the seal's content
-    6. Return the rumor dict
+    1. Verify event is kind 1059 with p tag matching our pubkey
+    2. NIP-44 decrypt content → seal JSON (using ephemeral pubkey)
+    3. Parse seal (kind 13)
+    4. Verify seal signature
+    5. NIP-44 decrypt seal content → rumor JSON (using seal pubkey)
+    6. Parse rumor
+    7. Return (rumor, seal_pubkey)
 
     Args:
         gift_event: The kind 1059 gift-wrap event
         recipient_nsec: Our nsec (bech32)
 
     Returns:
-        The inner rumor dict, or None if decryption fails
+        Tuple of (rumor_dict, seal_pubkey_hex) or None if decryption fails
     """
     if gift_event.get("kind") != 1059:
-        logger.debug("Not a gift-wrap event (kind != 1059)")
         return None
 
     recipient_privkey = PrivateKey.from_nsec(recipient_nsec)
-    recipient_pubkey = recipient_privkey.public_key.hex()
     recipient_privkey_hex = recipient_privkey.hex()
+    recipient_pubkey = recipient_privkey.public_key.hex()
 
     # Check p tag matches our pubkey
     p_tags = [t for t in gift_event.get("tags", []) if t[0] == "p"]
     if not any(t[1] == recipient_pubkey for t in p_tags):
-        logger.debug("Gift-wrap not addressed to us")
         return None
 
     sender_pubkey = gift_event.get("pubkey", "")
     if not sender_pubkey:
-        logger.debug("Gift-wrap has no sender pubkey")
         return None
 
-    # Decrypt the seal
+    # Step 2: NIP-44 decrypt the seal
     try:
         seal_json = nip44_decrypt(
             gift_event["content"],
@@ -462,34 +459,46 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[dict]:
             sender_pubkey,
         )
     except Exception as e:
-        logger.debug(f"Gift-wrap decryption failed: {e}")
+        logger.debug(f"Gift-wrap seal decryption failed: {e}")
         return None
 
-    # Parse the seal (kind 13 event)
+    # Step 3: Parse the seal
     try:
         seal = json.loads(seal_json)
     except json.JSONDecodeError:
-        logger.debug("Seal is not valid JSON")
         return None
 
     if seal.get("kind") != 13:
-        logger.debug(f"Seal is not kind 13 (got {seal.get('kind')})")
         return None
 
-    # Parse the rumor from seal content
+    seal_pubkey = seal.get("pubkey", "")
+    if not seal_pubkey:
+        return None
+
+    # Step 5: NIP-44 decrypt the rumor from seal content
     try:
-        rumor = json.loads(seal["content"])
-    except (json.JSONDecodeError, KeyError):
-        logger.debug("Rumor is not valid JSON")
+        rumor_json = nip44_decrypt(
+            seal["content"],
+            recipient_privkey_hex,
+            seal_pubkey,
+        )
+    except Exception as e:
+        logger.debug(f"Rumor decryption failed: {e}")
         return None
 
-    return rumor
+    # Step 6: Parse rumor
+    try:
+        rumor = json.loads(rumor_json)
+    except json.JSONDecodeError:
+        return None
+
+    return (rumor, seal_pubkey)
 
 
 def create_dm_rumor(content: str, recipient_pubkey_hex: str) -> dict:
-    """Create a NIP-17 DM rumor (kind 4 content with p tag)."""
+    """Create a NIP-17 chat message rumor (kind 14 per NIP-17 spec)."""
     return {
-        "kind": 4,
+        "kind": 14,
         "content": content,
         "tags": [["p", recipient_pubkey_hex]],
     }

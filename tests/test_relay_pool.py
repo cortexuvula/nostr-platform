@@ -13,24 +13,24 @@ class TestDedup:
 
     def test_new_event_is_accepted(self):
         """First sighting of an event ID should return True (new)."""
-        pool = RelayPool([], "nsec1test")
+        pool = RelayPool([])
         assert pool._check_dedup("event1") is True
 
     def test_duplicate_event_is_rejected(self):
         """Second sighting of same event ID should return False (dup)."""
-        pool = RelayPool([], "nsec1test")
+        pool = RelayPool([])
         pool._check_dedup("event1")
         assert pool._check_dedup("event1") is False
 
     def test_different_events_both_accepted(self):
         """Different event IDs should both be accepted."""
-        pool = RelayPool([], "nsec1test")
+        pool = RelayPool([])
         assert pool._check_dedup("event1") is True
         assert pool._check_dedup("event2") is True
 
     def test_dedup_eviction_at_capacity(self):
         """Dedup set should evict oldest entries at capacity."""
-        pool = RelayPool([], "nsec1test")
+        pool = RelayPool([])
         pool._max_dedup = 100  # Small limit for testing
 
         # Fill to capacity
@@ -82,13 +82,12 @@ class TestRelayPool:
         """RelayPool should initialize with correct config."""
         pool = RelayPool(
             ["wss://relay1.com", "wss://relay2.com"],
-            "nsec1test",
         )
         assert len(pool.relay_urls) == 2
         assert pool._running is False
 
     def test_no_relays(self):
         """RelayPool with no relays should still initialize."""
-        pool = RelayPool([], "nsec1test")
+        pool = RelayPool([])
         assert len(pool.relay_urls) == 0
         assert len(pool.connections) == 0

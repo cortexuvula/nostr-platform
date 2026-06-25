@@ -145,10 +145,12 @@ class TestGiftWrap:
         assert gift_event["pubkey"]  # ephemeral key
 
         # Unwrap as recipient B
-        unwrapped = unwrap_gift_wrap(gift_event, keypair_b["nsec"])
-        assert unwrapped is not None
+        result = unwrap_gift_wrap(gift_event, keypair_b["nsec"])
+        assert result is not None
+        unwrapped, seal_pubkey = result
         assert unwrapped["content"] == original_content
-        assert unwrapped["kind"] == 4
+        assert unwrapped["kind"] == 14  # NIP-17 chat message
+        assert seal_pubkey == keypair_a["pubkey"]  # sender's pubkey
 
     def test_unwrap_wrong_recipient_fails(self, keypair_a, keypair_b):
         """Unwrapping with wrong nsec should return None."""

@@ -186,7 +186,7 @@ class NostrAdapter(BasePlatformAdapter):
         self.require_nip05 = extra.get("require_nip05", False)
 
         # --- Components ---
-        self.relay_pool = RelayPool(self.relay_urls, self.nsec)
+        self.relay_pool = RelayPool(self.relay_urls)
         self.router = EventRouter(self)
         self.profiles = ProfileCache(self.relay_pool)
 
@@ -338,7 +338,7 @@ class NostrAdapter(BasePlatformAdapter):
         sender_name = self.profiles.get_display_name(sender_pubkey)
 
         source = self.build_source(
-            chat_id=event["id"],
+            chat_id=event.get("id", ""),
             chat_name=f"Nostr mention from {sender_name}",
             chat_type="group",
             user_id=sender_pubkey,
@@ -458,7 +458,7 @@ class NostrAdapter(BasePlatformAdapter):
                 recipient = _npub_to_hex(recipient)
 
             # Create a temporary relay pool
-            pool = RelayPool(relay_urls, nsec)
+            pool = RelayPool(relay_urls)
             await pool.connect()
 
             # Create and send DM
@@ -517,7 +517,7 @@ async def _standalone_send_async(chat_id: str, message: str, **kwargs) -> dict:
         if recipient.startswith("npub1"):
             recipient = _npub_to_hex(recipient)
 
-        pool = RelayPool(relay_urls, nsec)
+        pool = RelayPool(relay_urls)
         await pool.connect()
 
         rumor = create_dm_rumor(message, recipient)

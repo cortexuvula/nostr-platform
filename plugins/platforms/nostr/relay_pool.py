@@ -88,9 +88,8 @@ class RelayConnection:
 class RelayPool:
     """Manages multiple relay connections with dedup and failover."""
 
-    def __init__(self, relay_urls: list[str], nsec: str):
+    def __init__(self, relay_urls: list[str]):
         self.relay_urls = relay_urls
-        self.nsec = nsec
         self.connections: dict[str, RelayConnection] = {}
         self._seen_ids: OrderedDict = OrderedDict()
         self._event_queue: asyncio.Queue = asyncio.Queue()

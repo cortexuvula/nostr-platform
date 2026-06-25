@@ -39,51 +39,23 @@ class EventRouter:
 
     async def _handle_gift_wrap(self, event: dict, relay_url: str):
         """NIP-17: unwrap a kind 1059 gift-wrapped event."""
-        rumor = unwrap_gift_wrap(event, self.adapter.nsec)
-        if rumor is None:
+        result = unwrap_gift_wrap(event, self.adapter.nsec)
+        if result is None:
             logger.debug("Failed to unwrap gift-wrap — not for us or decrypt error")
             return
 
-        # The rumor's content is the actual message
+        rumor, seal_pubkey = result
+
         content = rumor.get("content", "")
         if not content:
             logger.debug("Gift-wrap rumor has no content")
             return
 
-        # Get sender from the seal — the gift-wrap's pubkey is the ephemeral key.
-        # The actual sender is the pubkey of the seal event inside.
-        # We need to extract it from the decrypted seal. The unwrap function
-        # returns just the rumor. The sender pubkey is on the seal event
-        # which we can get from the gift-wrap's decryption.
-        # For now, use the gift-wrap's pubkey as a fallback — but the real
-        # sender is the seal's pubkey.
-        # unwrap_gift_wrap already verified this, so let's extract sender.
-        # Actually, we need to modify unwrap to also return the seal pubkey.
-        # For now, use the event pubkey (ephemeral) — the adapter's auth
-        # check will need to use the seal's pubkey.
-        #
-        # We need to get the seal pubkey. Let's re-unwrap with more info.
-        from .crypto import _get_shared_secret, nip44_decrypt
-        from pynostr.key import PrivateKey
-        import json as _json
+        # The actual sender is the seal's pubkey (not the ephemeral gift-wrap pubkey)
+        actual_sender = seal_pubkey
 
-        recipient_privkey = PrivateKey.from_nsec(self.adapter.nsec)
-        recipient_privkey_hex = recipient_privkey.hex()
-        sender_pubkey = event.get("pubkey", "")
-
-        try:
-            seal_json = nip44_decrypt(
-                event["content"],
-                recipient_privkey_hex,
-                sender_pubkey,
-            )
-            seal = _json.loads(seal_json)
-            actual_sender = seal.get("pubkey", sender_pubkey)
-        except Exception:
-            actual_sender = sender_pubkey
-
-        # Check rumor kind — kind 4 is a DM
-        rumor_kind = rumor.get("kind", 4)
+        # Check rumor kind — kind 14 is a chat message, kind 4 is legacy DM
+        rumor_kind = rumor.get("kind", 14)
         if rumor_kind in (4, 14, 15):  # DM-related kinds
             await self.adapter._handle_dm(actual_sender, content, event)
         else:
@@ -101,8 +73,8 @@ class EventRouter:
             return  # Not our DM
 
         try:
-            from .crypto import _get_shared_secret, nip04_decrypt
             from pynostr.key import PrivateKey
+            from .crypto import nip04_decrypt
 
             recipient_privkey = PrivateKey.from_nsec(self.adapter.nsec)
             recipient_privkey_hex = recipient_privkey.hex()
