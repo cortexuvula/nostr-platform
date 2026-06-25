@@ -1,0 +1,44 @@
+name: nostr-platform
+label: Nostr
+kind: platform
+version: 1.0.0
+description: >
+  Nostr gateway adapter for Hermes Agent.
+  Connects to Nostr relays via WebSocket, receives NIP-17 encrypted DMs
+  and optional public mentions, and replies as signed Nostr events.
+  Federated, censorship-resistant, E2E encrypted.
+author: Hermes Community
+requires_env:
+  - name: NOSTR_NSEC
+    description: "Agent's Nostr private key (nsec1...). Generate with: nak key generate"
+    prompt: "Nostr private key (nsec)"
+    password: true
+  - name: NOSTR_RELAYS
+    description: "Comma-separated relay URLs (e.g. wss://relay.example.com,wss://nostr.wine)"
+    prompt: "Relay URLs (comma-separated)"
+    password: false
+optional_env:
+  - name: NOSTR_ALLOWED_USERS
+    description: "Comma-separated npubs allowed to DM the agent"
+    prompt: "Allowed npubs (comma-separated)"
+    password: false
+  - name: NOSTR_ALLOW_ALL_USERS
+    description: "Allow anyone to DM the agent (dev only — disables allowlist)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: NOSTR_HOME_CHANNEL
+    description: "Default npub for cron/notification delivery"
+    prompt: "Home channel npub"
+    password: false
+  - name: NOSTR_MONITOR_MENTIONS
+    description: "Monitor public mentions (kind 1 with p tag). Default: false"
+    prompt: "Monitor public mentions? (true/false)"
+    password: false
+  - name: NOSTR_REPLY_PUBLICLY
+    description: "Reply to mentions publicly (kind 1) instead of DM. Default: false"
+    prompt: "Reply publicly to mentions? (true/false)"
+    password: false
+  - name: NOSTR_REQUIRE_NIP05
+    description: "Only accept DMs from NIP-05 verified users. Default: false"
+    prompt: "Require NIP-05 verification? (true/false)"
+    password: false
