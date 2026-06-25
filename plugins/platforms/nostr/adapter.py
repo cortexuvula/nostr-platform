@@ -475,7 +475,7 @@ async def _standalone_send_async(chat_id: str, message: str, **kwargs) -> dict:
             recipient = _npub_to_hex(recipient)
 
         pool = RelayPool(relay_urls)
-        await pool.connect()
+        await pool.connect_only()
 
         rumor = create_dm_rumor(message, recipient)
         gift_event = create_gift_wrap(rumor, recipient, nsec)

@@ -113,13 +113,22 @@ class RelayPool:
         return True
 
     async def connect(self):
-        """Connect to all relays concurrently."""
+        """Connect to all relays and start listening (for gateway mode)."""
         self._running = True
         tasks = []
         for url in self.relay_urls:
             conn = RelayConnection(url)
             self.connections[url] = conn
             tasks.append(self._connect_and_listen(conn))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def connect_only(self):
+        """Connect to all relays without starting listen loops (for one-shot sends)."""
+        tasks = []
+        for url in self.relay_urls:
+            conn = RelayConnection(url)
+            self.connections[url] = conn
+            tasks.append(conn.connect())
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _connect_and_listen(self, conn: RelayConnection):
