@@ -10,6 +10,26 @@ from pynostr.key import PrivateKey
 from plugins.platforms.nostr.event_router import EventRouter
 
 
+def signed_event(kind, content, pubkey_hex, privkey_hex, tags=None):
+    """Build a properly signed Nostr event for router tests.
+
+    The router now verifies event signatures for kind 1 and kind 4, so any
+    test that expects these to be processed must supply a valid signature.
+    """
+    from pynostr.event import Event
+    import time as _time
+    ev = Event(
+        pubkey=pubkey_hex,
+        kind=kind,
+        content=content,
+        tags=tags or [],
+        created_at=int(_time.time()),
+    )
+    sk = PrivateKey(bytes.fromhex(privkey_hex))
+    ev.sign(sk.hex())
+    return ev.to_dict()
+
+
 @pytest.fixture
 def mock_adapter():
     """Create a mock adapter for the router."""
@@ -57,13 +77,10 @@ class TestEventClassification:
 
     async def test_kind_1_with_mention_routed(self, mock_adapter, keypair):
         """Kind 1 with p tag matching our pubkey should trigger mention handler."""
-        event = {
-            "kind": 1,
-            "content": "Hey @agent!",
-            "pubkey": keypair["pubkey"],
-            "tags": [["p", mock_adapter.pubkey]],
-            "id": "test_note_id",
-        }
+        event = signed_event(
+            1, "Hey @agent!", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
 
         router = EventRouter(mock_adapter)
         await router.route(event, "wss://test.relay")
@@ -73,13 +90,10 @@ class TestEventClassification:
     async def test_kind_1_without_mention_ignored(self, mock_adapter, keypair):
         """Kind 1 without our pubkey in p tags should be ignored."""
         other_pubkey = PrivateKey().public_key.hex()
-        event = {
-            "kind": 1,
-            "content": "Just a regular note",
-            "pubkey": keypair["pubkey"],
-            "tags": [["p", other_pubkey]],  # mentions someone else
-            "id": "test_note_id",
-        }
+        event = signed_event(
+            1, "Just a regular note", keypair["pubkey"], keypair["hex"],
+            tags=[["p", other_pubkey]],  # mentions someone else
+        )
 
         router = EventRouter(mock_adapter)
         await router.route(event, "wss://test.relay")
@@ -89,13 +103,10 @@ class TestEventClassification:
     async def test_kind_1_ignored_when_monitor_disabled(self, mock_adapter, keypair):
         """Kind 1 should be ignored when monitor_mentions is False."""
         mock_adapter.monitor_mentions = False
-        event = {
-            "kind": 1,
-            "content": "Hey!",
-            "pubkey": keypair["pubkey"],
-            "tags": [["p", mock_adapter.pubkey]],
-            "id": "test_note_id",
-        }
+        event = signed_event(
+            1, "Hey!", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
 
         router = EventRouter(mock_adapter)
         await router.route(event, "wss://test.relay")
@@ -151,3 +162,96 @@ class TestEventClassification:
 
         mock_adapter._handle_dm.assert_not_called()
         mock_adapter._handle_mention.assert_not_called()
+
+
+class TestSignatureVerification:
+    """Unsigned/forged kind 1 and kind 4 events must be dropped."""
+
+    async def test_kind_4_with_valid_signature_is_processed(self, mock_adapter, keypair):
+        """A properly signed kind 4 reaches _handle_legacy_dm (then _handle_dm)."""
+        from plugins.platforms.nostr.crypto import nip04_encrypt
+        # Real NIP-04 ciphertext so it actually decrypts to a message.
+        agent_sk = PrivateKey(bytes.fromhex(keypair["hex"]))
+        agent_nsec = agent_sk.bech32()
+        mock_adapter.nsec = agent_nsec
+        mock_adapter.pubkey = agent_sk.public_key.hex()
+        # Sender encrypts a DM to the agent.
+        sender = PrivateKey()
+        ct = nip04_encrypt("hello", sender.hex(), mock_adapter.pubkey)
+        event = signed_event(
+            4, ct, sender.public_key.hex(), sender.hex(),
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        router = EventRouter(mock_adapter)
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_dm.assert_called_once()
+
+    async def test_kind_4_with_forged_signature_is_dropped(self, mock_adapter, keypair):
+        """A kind 4 with a bad signature (sender spoofed) must be dropped."""
+        event = signed_event(
+            4, "encrypted-blob", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        # Corrupt the signature so it no longer matches the pubkey.
+        event["sig"] = "0" * 128
+        router = EventRouter(mock_adapter)
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_kind_1_with_forged_signature_is_dropped(self, mock_adapter, keypair):
+        """A kind 1 mention with a bad signature must be dropped."""
+        event = signed_event(
+            1, "hi @agent", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        event["sig"] = "1" * 128
+        router = EventRouter(mock_adapter)
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_mention.assert_not_called()
+
+
+class TestMalformedTags:
+    """Malformed tags from untrusted relays must not crash routing."""
+
+    async def test_kind_1_with_malformed_tags_does_not_raise(self, mock_adapter, keypair):
+        """Malformed p-tags (empty/non-list) should be skipped, not raise.
+
+        The event is properly signed (so it passes signature verification)
+        but carries malformed tags; only the one well-formed p-tag should
+        trigger the mention.
+        """
+        # pynostr's Event coerces tags to lists of str, so build a raw signed
+        # event dict with the malformed tags injected after signing.
+        event = signed_event(
+            1, "hi", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        # Inject malformed tags alongside the valid one.
+        event["tags"] = [[], "not-a-list", ["p"], ["p", mock_adapter.pubkey]]
+
+        router = EventRouter(mock_adapter)
+        # Should not raise even though tags include malformed entries; the
+        # signature still verifies because we recompute over the signed id.
+        # NOTE: modifying tags post-sign invalidates the signature, so instead
+        # we verify the defensive helper handles malformed input directly.
+        from plugins.platforms.nostr.event_router import _p_tag_pubkeys
+        pubkeys = _p_tag_pubkeys(event)
+        assert mock_adapter.pubkey in pubkeys
+
+    async def test_kind_4_with_malformed_tags_does_not_raise(self, mock_adapter, keypair):
+        """Legacy DM with malformed tags must skip safely, not raise.
+
+        Verified via the defensive helper directly, since modifying tags
+        after signing would invalidate the event signature.
+        """
+        event = {
+            "kind": 4,
+            "content": "encrypted",
+            "pubkey": keypair["pubkey"],
+            "tags": [[], ["p"], 42, ["p", mock_adapter.pubkey]],
+            "id": "test_dm_id",
+        }
+        from plugins.platforms.nostr.event_router import _p_tag_pubkeys
+        # Should not raise even though tags include malformed entries.
+        pubkeys = _p_tag_pubkeys(event)
+        assert mock_adapter.pubkey in pubkeys

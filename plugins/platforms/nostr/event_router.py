@@ -12,7 +12,37 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from .adapter import NostrAdapter
 
+from pynostr.event import Event
 from .crypto import unwrap_gift_wrap, nip04_decrypt
+
+
+def _verify_signature(event: dict) -> bool:
+    """Verify an event's secp256k1 signature.
+
+    Trusting event['pubkey'] without verification lets a relay forge a DM
+    from an arbitrary pubkey (the decrypt key would be derived from that
+    pubkey). Gift-wraps verify their seal in unwrap_gift_wrap; for plain
+    events we verify here. Returns True only on a valid signature.
+    """
+    try:
+        ev = Event.from_dict(event)
+        return ev.verify()
+    except Exception:
+        return False
+
+
+def _p_tag_pubkeys(event: dict) -> list[str]:
+    """Return all pubkey values from 'p' tags, defensively.
+
+    Tags from untrusted relays may be empty, non-list, or malformed, so each
+    tag is checked for type and length before indexing (unlike a naive
+    ``t[0] == 'p'`` which raises IndexError/TypeError on malformed tags).
+    """
+    pubkeys = []
+    for tag in event.get("tags", []):
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p":
+            pubkeys.append(tag[1])
+    return pubkeys
 
 
 class EventRouter:
@@ -28,8 +58,18 @@ class EventRouter:
         if kind == 1059:  # NIP-17 gift-wrapped DM
             await self._handle_gift_wrap(event, relay_url)
         elif kind == 1:   # text note — check for mentions
+            # Verify signature before trusting event['pubkey'] as the author;
+            # otherwise a relay can forge a mention from an arbitrary pubkey.
+            if not _verify_signature(event):
+                logger.debug(f"Dropping kind 1 with invalid signature: {event.get('id', '?')[:16]}")
+                return
             await self._handle_text_note(event, relay_url)
         elif kind == 4:   # NIP-04 DM (legacy)
+            # Same forgery protection: a forged kind 4 could otherwise be
+            # attributed to a spoofed sender pubkey.
+            if not _verify_signature(event):
+                logger.debug(f"Dropping kind 4 with invalid signature: {event.get('id', '?')[:16]}")
+                return
             await self._handle_legacy_dm(event, relay_url)
         elif kind == 0:   # metadata — update profile cache
             await self._handle_metadata(event, relay_url)
@@ -66,15 +106,13 @@ class EventRouter:
         sender_pubkey = event.get("pubkey", "")
         content = event.get("content", "")
 
-        # Check this DM is addressed to us
-        p_tags = [t for t in event.get("tags", []) if t[0] == "p"]
+        # Check this DM is addressed to us (defensive p-tag parsing).
         our_pubkey = self.adapter.pubkey
-        if not any(t[1] == our_pubkey for t in p_tags):
+        if our_pubkey not in _p_tag_pubkeys(event):
             return  # Not our DM
 
         try:
             from pynostr.key import PrivateKey
-            from .crypto import nip04_decrypt
 
             recipient_privkey = PrivateKey.from_nsec(self.adapter.nsec)
             recipient_privkey_hex = recipient_privkey.hex()
@@ -88,7 +126,7 @@ class EventRouter:
             logger.warning(f"Failed to decrypt legacy DM: {e}")
             return
 
-        await self.adapter._handle_dm(sender_pubkey, plaintext, event)
+        await self.adapter._handle_dm(sender_pubkey, plaintext, event, dm_protocol="nip04")
 
     async def _handle_text_note(self, event: dict, relay_url: str):
         """Check if a kind 1 text note mentions our pubkey."""
@@ -96,14 +134,7 @@ class EventRouter:
             return
 
         our_pubkey = self.adapter.pubkey
-        is_mention = False
-
-        for tag in event.get("tags", []):
-            if tag[0] == "p" and tag[1] == our_pubkey:
-                is_mention = True
-                break
-
-        if not is_mention:
+        if our_pubkey not in _p_tag_pubkeys(event):
             return
 
         await self.adapter._handle_mention(event)

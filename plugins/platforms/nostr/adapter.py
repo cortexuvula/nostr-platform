@@ -53,6 +53,7 @@ from .crypto import (
     EventSigner,
     create_gift_wrap,
     create_dm_rumor,
+    nip04_encrypt,
     npub_to_hex,
     hex_to_npub,
 )
@@ -81,19 +82,17 @@ def check_requirements() -> bool:
     return NOSTR_AVAILABLE
 
 
-def validate_config(config) -> List[str]:
-    """Validate config. Return list of error messages (empty = valid)."""
-    errors = []
+def validate_config(config) -> bool:
+    """Validate config. Return True if valid, False otherwise."""
     nsec = os.getenv("NOSTR_NSEC")
     if not nsec:
-        errors.append("NOSTR_NSEC is required")
+        return False
     relays = os.getenv("NOSTR_RELAYS")
     if not relays:
-        # Check config.yaml extra
         extra = getattr(config, "extra", {}) or {}
         if not extra.get("relays"):
-            errors.append("NOSTR_RELAYS is required")
-    return errors
+            return False
+    return True
 
 
 def is_connected(config) -> bool:
@@ -115,6 +114,9 @@ def _env_enablement():
     ).lower() in {"1", "true", "yes"}
     extra["require_nip05"] = os.getenv(
         "NOSTR_REQUIRE_NIP05", ""
+    ).lower() in {"1", "true", "yes"}
+    extra["legacy_dm"] = os.getenv(
+        "NOSTR_LEGACY_DM", "true"
     ).lower() in {"1", "true", "yes"}
 
     home_channel = os.getenv("NOSTR_HOME_CHANNEL")
@@ -184,6 +186,12 @@ class NostrAdapter(BasePlatformAdapter):
         self.monitor_mentions = extra.get("monitor_mentions", False)
         self.reply_publicly = extra.get("reply_publicly", False)
         self.require_nip05 = extra.get("require_nip05", False)
+        # Legacy NIP-04 (kind 4) DM ingestion. Defaults to True for backward
+        # compat; set NOSTR_LEGACY_DM=false to run NIP-17-only.
+        self.legacy_dm = extra.get(
+            "legacy_dm",
+            os.getenv("NOSTR_LEGACY_DM", "true").lower() in {"1", "true", "yes"},
+        )
 
         # --- Components ---
         self.relay_pool = RelayPool(self.relay_urls)
@@ -193,6 +201,10 @@ class NostrAdapter(BasePlatformAdapter):
         # --- State ---
         self._running = False
         self._listen_task: Optional[asyncio.Task] = None
+        # Pubkeys that have sent us legacy NIP-04 (kind 4) DMs. Replies to
+        # these peers use nip04_encrypt so legacy-only clients can read them;
+        # everyone else gets NIP-17 gift-wrapped replies.
+        self._legacy_peers: set[str] = set()
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter implementation
@@ -212,10 +224,12 @@ class NostrAdapter(BasePlatformAdapter):
 
         # Subscribe to our DMs (NIP-17 gift wraps)
         # kind 1059 events with a p tag matching our pubkey
+        # No "since" — fetch recent events so we don't miss DMs that
+        # arrived while the gateway was down
         dm_filter = {
             "kinds": [1059],
             "#p": [self.pubkey],
-            "since": int(time.time()),
+            "limit": 50,
         }
 
         filters = [dm_filter]
@@ -225,17 +239,27 @@ class NostrAdapter(BasePlatformAdapter):
             mention_filter = {
                 "kinds": [1],
                 "#p": [self.pubkey],
-                "since": int(time.time()),
+                "limit": 10,
             }
             filters.append(mention_filter)
 
-        # Also subscribe to legacy NIP-04 DMs (kind 4)
-        legacy_dm_filter = {
-            "kinds": [4],
-            "#p": [self.pubkey],
-            "since": int(time.time()),
-        }
-        filters.append(legacy_dm_filter)
+        # Legacy NIP-04 (kind 4) DMs — opt-in only. Defaults to on so
+        # existing deployments keep receiving legacy DMs, but operators who
+        # want NIP-17-only can disable it via NOSTR_LEGACY_DM=false.
+        if self.legacy_dm:
+            legacy_dm_filter = {
+                "kinds": [4],
+                "#p": [self.pubkey],
+                "limit": 50,
+            }
+            filters.append(legacy_dm_filter)
+
+        # NOTE: We do NOT add a kind 0 (metadata) subscription here. Kind 0
+        # events are replaceable and carry no p-tags, so a "#p": [self.pubkey]
+        # filter matches nothing, and a bare "kinds": [0] filter floods the
+        # connection. Instead, profiles are resolved on demand by
+        # ProfileCache.get_profile() via a targeted kind 0 query for a specific
+        # author, and EventRouter still handles any incidental kind 0 events.
 
         await self.relay_pool.subscribe(filters)
 
@@ -282,8 +306,13 @@ class NostrAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_dm(self, sender_pubkey: str, content: str,
-                         original_event: dict):
-        """Handle a decrypted DM message."""
+                         original_event: dict, dm_protocol: str = "nip17"):
+        """Handle a decrypted DM message.
+
+        ``dm_protocol`` records how the inbound DM arrived so replies go back
+        over the same wire format: "nip04" clients (legacy kind 4) only speak
+        NIP-04, so replying with a NIP-17 gift-wrap would be invisible to them.
+        """
         # Authorization check
         if not self.allow_all and sender_pubkey not in self.allowed_users:
             logger.info(
@@ -299,6 +328,11 @@ class NostrAdapter(BasePlatformAdapter):
                     f"Nostr: DM from non-NIP-05 user {sender_pubkey[:16]}..."
                 )
                 return
+
+        # Remember which wire format this peer used, so send() replies in kind.
+        # A legacy (NIP-04) client cannot read NIP-17 gift-wraps and vice versa.
+        if dm_protocol == "nip04":
+            self._legacy_peers.add(sender_pubkey)
 
         # Get sender display name
         sender_name = self.profiles.get_display_name(sender_pubkey)
@@ -330,6 +364,7 @@ class NostrAdapter(BasePlatformAdapter):
         """Handle a public mention (kind 1 with our pubkey in p tags)."""
         sender_pubkey = event.get("pubkey", "")
         content = event.get("content", "")
+        note_id = event.get("id", "")
 
         # Authorization
         if not self.allow_all and sender_pubkey not in self.allowed_users:
@@ -337,13 +372,17 @@ class NostrAdapter(BasePlatformAdapter):
 
         sender_name = self.profiles.get_display_name(sender_pubkey)
 
+        # chat_id = sender pubkey so a private DM reply is correctly addressed.
+        # thread_id = note id so the gateway forwards it as metadata["thread_id"],
+        # which send() uses as the reply-to anchor for a public kind 1 reply.
         source = self.build_source(
-            chat_id=event.get("id", ""),
+            chat_id=sender_pubkey,
             chat_name=f"Nostr mention from {sender_name}",
             chat_type="group",
             user_id=sender_pubkey,
             user_name=sender_name,
-            message_id=event["id"],
+            thread_id=note_id,
+            message_id=note_id,
         )
 
         msg = MessageEvent(
@@ -351,7 +390,7 @@ class NostrAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=event,
-            message_id=event["id"],
+            message_id=note_id,
             timestamp=datetime.now(timezone.utc),
         )
         await self.handle_message(msg)
@@ -360,29 +399,46 @@ class NostrAdapter(BasePlatformAdapter):
     # Outbound: send replies
     # ------------------------------------------------------------------
 
-    async def send(self, chat_id: str, text: str,
-                   metadata: dict = None, **kwargs) -> SendResult:
+    async def send(self, chat_id: str, content: str = None,
+                   text: str = None, metadata: dict = None,
+                   reply_to: str = None, **kwargs) -> SendResult:
         """Send a reply message.
 
-        For DMs (chat_id is a pubkey hex): send as NIP-17 gift-wrapped DM.
-        For mentions (chat_id is a note id): reply as kind 1 text note
-        (if reply_publicly=True) or DM the author (if reply_publicly=False).
+        ``chat_id`` is always a hex pubkey — the DM recipient or the mention
+        author. For mention replies, the triggering note id is carried as
+        ``metadata["thread_id"]`` (set from ``source.thread_id`` by the
+        gateway's metadata builder) or as ``reply_to``.
+
+        - Mention + reply_publicly: kind 1 text note replying to the note.
+        - Mention + private (or any DM): NIP-17 gift-wrapped DM to chat_id.
+        - Plain DM: NIP-17 gift-wrapped DM to chat_id.
+
+        Accepts both 'content' (gateway convention) and 'text' (legacy).
         """
+        # Normalize: gateway uses 'content', some callers use 'text'
+        msg_text = content if content is not None else text
+        if msg_text is None:
+            return SendResult(success=False, error="No message text provided")
         if not self._signer:
             return SendResult(success=False, error="No nsec configured")
 
-        is_mention_reply = metadata and metadata.get("nostr_reply_to_note")
+        # Resolve a reply-to note id (mention context), if any. The gateway
+        # forwards source.thread_id as metadata["thread_id"]; reply_to is the
+        # explicit reply anchor the gateway also passes.
+        note_id = None
+        if metadata:
+            note_id = metadata.get("thread_id") or metadata.get("nostr_reply_to_note")
+        if not note_id and reply_to:
+            note_id = reply_to
 
-        if is_mention_reply and self.reply_publicly:
-            # Public reply (kind 1)
-            note_id = chat_id
-            author_pubkey = metadata.get("nostr_author_pubkey", "")
+        if note_id and self.reply_publicly:
+            # Public reply (kind 1) to the triggering note.
             event = self._signer.sign_event(
                 kind=1,
-                content=text,
+                content=msg_text,
                 tags=[
                     ["e", note_id, "", "reply"],
-                    ["p", author_pubkey],
+                    ["p", chat_id],  # mention author
                 ],
             )
             await self.relay_pool.publish(event)
@@ -391,14 +447,26 @@ class NostrAdapter(BasePlatformAdapter):
                 message_id=event.get("id"),
             )
         else:
-            # DM reply (NIP-17)
+            # DM reply to chat_id (a hex pubkey). Reply over the same wire
+            # format the peer used to reach us: legacy NIP-04 (kind 4) for
+            # peers known to speak only NIP-04, else NIP-17 gift-wrap.
             recipient = chat_id
-            rumor = create_dm_rumor(text, recipient)
-            gift_event = create_gift_wrap(rumor, recipient, self.nsec)
-            await self.relay_pool.publish(gift_event)
+            if recipient in self._legacy_peers:
+                content = nip04_encrypt(
+                    msg_text, self._signer._privkey_hex, recipient
+                )
+                dm_event = self._signer.sign_event(
+                    kind=4,
+                    content=content,
+                    tags=[["p", recipient]],
+                )
+            else:
+                rumor = create_dm_rumor(msg_text, recipient)
+                dm_event = create_gift_wrap(rumor, recipient, self.nsec)
+            await self.relay_pool.publish(dm_event)
             return SendResult(
                 success=True,
-                message_id=gift_event.get("id"),
+                message_id=dm_event.get("id"),
             )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -458,8 +526,22 @@ def register(ctx):
     )
 
 
-async def _standalone_send_async(chat_id: str, message: str, **kwargs) -> dict:
-    """Async wrapper for standalone cron delivery."""
+async def _standalone_send_async(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[list] = None,
+    force_document: bool = False,
+    **kwargs,
+) -> dict:
+    """Async standalone sender for cron / out-of-process delivery.
+
+    Signature matches the gateway's standalone_sender_fn contract used by
+    ``tools/send_message_tool.py`` and every other platform plugin:
+    ``(pconfig, chat_id, message, *, thread_id, media_files, force_document)``.
+    """
     try:
         nsec = os.getenv("NOSTR_NSEC", "")
         if not nsec:
@@ -475,12 +557,24 @@ async def _standalone_send_async(chat_id: str, message: str, **kwargs) -> dict:
             recipient = _npub_to_hex(recipient)
 
         pool = RelayPool(relay_urls)
-        await pool.connect_only()
+        # Use the full connect() (not connect_only) so per-relay listen loops
+        # run and publish() can actually await OK frames. connect_only() opens
+        # sockets with no reader, so the EVENT frame can be dropped before the
+        # relay processes it and OK responses are never received.
+        await pool.connect()
 
         rumor = create_dm_rumor(message, recipient)
         gift_event = create_gift_wrap(rumor, recipient, nsec)
         try:
-            await pool.publish(gift_event)
+            results = await pool.publish(gift_event, timeout=5.0)
+            # publish() returns {} if no relay acknowledged within the timeout.
+            accepted = any(r.get("accepted") for r in results.values())
+            if not results or not accepted:
+                urls = ", ".join(results.keys()) or "(no responses)"
+                return {
+                    "error": f"No relay accepted the event ({urls})",
+                    "message_id": gift_event.get("id"),
+                }
             return {"success": True, "message_id": gift_event.get("id")}
         finally:
             await pool.disconnect()
