@@ -290,14 +290,24 @@ def nip04_decrypt(payload: str, recipient_privkey_hex: str,
                   sender_pubkey_hex: str) -> str:
     """NIP-04 legacy DM decrypt.
 
-    Payload format: base64(ciphertext)?iv=base64(iv)
+    Payload format: base64(ciphertext)?iv=base64(iv). Raises ValueError on a
+    malformed payload so callers can distinguish bad input from decrypt failure.
     """
     if "?iv=" not in payload:
         raise ValueError("Invalid NIP-04 payload: missing iv")
 
     ct_b64, iv_b64 = payload.split("?iv=", 1)
-    ciphertext = base64.b64decode(ct_b64)
-    iv = base64.b64decode(iv_b64)
+
+    # Strict base64 decode — reject non-canonical input (whitespace, bad
+    # padding) up front with a clear error rather than a confusing AES failure.
+    try:
+        ciphertext = base64.b64decode(ct_b64, validate=True)
+        iv = base64.b64decode(iv_b64, validate=True)
+    except Exception as e:
+        raise ValueError(f"Invalid NIP-04 payload: bad base64 ({e})") from e
+
+    if len(iv) != 16:
+        raise ValueError(f"Invalid NIP-04 iv length: {len(iv)} (expected 16)")
 
     # ECDH shared secret (raw X coordinate)
     shared = _get_shared_secret(recipient_privkey_hex, sender_pubkey_hex)

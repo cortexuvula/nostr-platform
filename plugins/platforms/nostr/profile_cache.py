@@ -31,19 +31,22 @@ class ProfileCache:
         if entry and time.time() - entry.get("fetched_at", 0) < self.ttl:
             return entry
 
-        # Try fetching from relays
+        # Fetch kind 0 metadata from relays. This carries the nip05 field
+        # if the user published one.
         profile = await self._fetch_from_relays(pubkey)
+
+        # If metadata declares a nip05 identifier, verify it resolves back to
+        # this pubkey via the NIP-05 DNS/.well-known flow.
+        if profile and profile.get("nip05"):
+            verified = await self._nip05_lookup(pubkey, profile["nip05"])
+            if verified is None:
+                # Identifier present but verification failed: don't trust it.
+                profile["nip05"] = None
+
         if profile:
             profile["fetched_at"] = time.time()
             self.cache[pubkey] = profile
             return profile
-
-        # Fallback: try NIP-05
-        nip05_profile = await self._nip05_lookup(pubkey)
-        if nip05_profile:
-            nip05_profile["fetched_at"] = time.time()
-            self.cache[pubkey] = nip05_profile
-            return nip05_profile
 
         # Return minimal profile
         fallback = {
@@ -57,42 +60,34 @@ class ProfileCache:
         return fallback
 
     async def _fetch_from_relays(self, pubkey: str) -> Optional[dict]:
-        """Fetch kind 0 metadata for a pubkey from relays."""
+        """Fetch kind 0 metadata for a pubkey from relays via a one-shot query.
+
+        Uses ``RelayPool.query()`` which routes the REQ's events back to us
+        (rather than into the global event stream) and stops at EOSE.
+        """
         if not self.relay_pool or not self.relay_pool.connections:
             return None
-
-        # Send a REQ for kind 0 from this author
-        import json as _json
-        sub_id = f"profile_{pubkey[:8]}"
 
         filter_dict = {
             "kinds": [0],
             "authors": [pubkey],
             "limit": 1,
         }
+        try:
+            events = await self.relay_pool.query(filter_dict, timeout=5.0)
+        except Exception as e:
+            logger.debug(f"Profile query failed for {pubkey[:12]}...: {e}")
+            return None
 
-        req = _json.dumps(["REQ", sub_id, filter_dict])
+        if not events:
+            return None
 
-        # Send to all connected relays
-        for conn in self.relay_pool.connections.values():
-            if conn.connected:
-                await conn.send_raw(req)
-
-        # Wait briefly for responses
-        await asyncio.sleep(2.0)
-
-        # Send CLOSE
-        close = _json.dumps(["CLOSE", sub_id])
-        for conn in self.relay_pool.connections.values():
-            if conn.connected:
-                await conn.send_raw(close)
-
-        # Check if any profile events arrived via the event queue
-        # Note: this is a simplified approach. In production, we'd use
-        # a dedicated response future/promise per query.
-        # For now, return None — profiles will be populated by the
-        # event router when it sees kind 0 events.
-        return None
+        # Most recent metadata event wins (highest created_at).
+        latest = max(events, key=lambda e: e.get("created_at", 0))
+        try:
+            return json.loads(latest.get("content", "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     async def update_from_event(self, pubkey: str, profile_data: dict):
         """Update cache from a kind 0 metadata event."""
@@ -102,15 +97,41 @@ class ProfileCache:
         self.cache[pubkey] = entry
         logger.debug(f"Updated profile cache for {pubkey[:12]}...")
 
-    async def _nip05_lookup(self, pubkey: str) -> Optional[dict]:
-        """NIP-05 DNS-based verification lookup.
+    async def _nip05_lookup(self, pubkey: str, identifier: str) -> Optional[dict]:
+        """NIP-05 verification: confirm *identifier* maps to *pubkey*.
 
-        Checks if the pubkey has a NIP-05 identifier by querying
-        the relays for kind 0 first, then doing the DNS verification.
+        NIP-05 queries ``https://<domain>/.well-known/nostr.json?name=<user>``
+        and checks the returned pubkey matches. Requires a known identifier
+        (``user@domain``), which is taken from the sender's kind 0 metadata.
+        Returns a profile dict with ``nip05`` set if verified, else None.
         """
-        # This is a best-effort lookup. NIP-05 requires a known
-        # identifier (user@domain) to query. We can't reverse-lookup
-        # from pubkey alone. Return None for now.
+        if not identifier or "@" not in identifier:
+            return None
+        name, _, domain = identifier.partition("@")
+        if not name or not domain:
+            return None
+
+        url = f"https://{domain}/.well-known/nostr.json?name={name}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+        except Exception as e:
+            logger.debug(f"NIP-05 lookup failed for {identifier}: {e}")
+            return None
+
+        names = data.get("names", {})
+        # NIP-05: names[<name>] == pubkey hex confirms the identifier.
+        if names.get(name) == pubkey:
+            return {
+                "name": data.get("names", {}).get(name, name),
+                "nip05": identifier,
+                "picture": None,
+                "about": "",
+            }
         return None
 
     def get_display_name(self, pubkey: str) -> str:
