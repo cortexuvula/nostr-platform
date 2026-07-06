@@ -21,6 +21,9 @@ class ProfileCache:
         self.cache: dict[str, dict] = {}
         self.ttl = ttl
         self.relay_pool = relay_pool
+        # Reuse a single aiohttp session for all NIP-05 lookups instead of
+        # creating one per request (resource leak at scale).
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
     async def get_profile(self, pubkey: str) -> dict:
         """Get cached profile or fetch from relays.
@@ -113,12 +116,15 @@ class ProfileCache:
 
         url = f"https://{domain}/.well-known/nostr.json?name={name}"
         try:
-            timeout = aiohttp.ClientTimeout(total=5.0)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
+            # Reuse a single session across lookups instead of creating
+            # a new one each time (avoids socket / connection-pool churn).
+            if self._http_session is None or self._http_session.closed:
+                timeout = aiohttp.ClientTimeout(total=5.0)
+                self._http_session = aiohttp.ClientSession(timeout=timeout)
+            async with self._http_session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
         except Exception as e:
             logger.debug(f"NIP-05 lookup failed for {identifier}: {e}")
             return None
@@ -149,3 +155,9 @@ class ProfileCache:
     def clear(self):
         """Clear the entire profile cache."""
         self.cache.clear()
+
+    async def close(self):
+        """Close the HTTP session and release resources."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None

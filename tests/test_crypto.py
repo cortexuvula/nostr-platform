@@ -3,6 +3,7 @@ Tests for Nostr crypto module — NIP-04, event signing, gift-wrap round-trip.
 """
 
 import json
+import time
 import pytest
 from pynostr.key import PrivateKey, PublicKey
 
@@ -209,10 +210,28 @@ class TestNIP04Interop:
 class TestGiftWrap:
     """Test NIP-17 gift-wrap create/unwrap."""
 
+    def test_rumor_has_required_fields(self, keypair_a, keypair_b):
+        """NIP-17: the kind-14 rumor must carry id, pubkey (sender's), sig.
+
+        Strict clients verify ``rumor.pubkey == seal.pubkey`` to prevent
+        impersonation, so the sender's real pubkey must be present.
+        """
+        rumor = create_dm_rumor("hello", keypair_b["pubkey"], keypair_a["pubkey"])
+        assert rumor["kind"] == 14
+        assert rumor["content"] == "hello"
+        assert rumor["id"] == ""
+        assert rumor["pubkey"] == keypair_a["pubkey"]
+        assert rumor["sig"] == ""
+        assert rumor["created_at"] > 0
+        # recipient p-tag present
+        p_tags = [t for t in rumor["tags"] if t[0] == "p"]
+        assert any(t[1] == keypair_b["pubkey"] for t in p_tags)
+
     def test_gift_wrap_roundtrip(self, keypair_a, keypair_b):
         """Gift-wrap then unwrap — rumor content must match."""
         original_content = "Encrypted DM via NIP-17!"
-        rumor = create_dm_rumor(original_content, keypair_b["pubkey"])
+        rumor = create_dm_rumor(original_content, keypair_b["pubkey"],
+                                keypair_a["pubkey"])
         gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
                                        keypair_a["nsec"])
 
@@ -226,11 +245,12 @@ class TestGiftWrap:
         assert unwrapped["content"] == original_content
         assert unwrapped["kind"] == 14  # NIP-17 chat message
         assert seal_pubkey == keypair_a["pubkey"]  # sender's pubkey
+        assert unwrapped["pubkey"] == keypair_a["pubkey"]  # sender's pubkey
 
     def test_unwrap_wrong_recipient_fails(self, keypair_a, keypair_b):
         """Unwrapping with wrong nsec should return None."""
         sk_c = PrivateKey()
-        rumor = create_dm_rumor("test", keypair_b["pubkey"])
+        rumor = create_dm_rumor("test", keypair_b["pubkey"], keypair_a["pubkey"])
         gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
                                        keypair_a["nsec"])
 
@@ -240,10 +260,75 @@ class TestGiftWrap:
 
     def test_gift_wrap_has_correct_tags(self, keypair_a, keypair_b):
         """Gift-wrap should have p tag with recipient pubkey."""
-        rumor = create_dm_rumor("test", keypair_b["pubkey"])
+        rumor = create_dm_rumor("test", keypair_b["pubkey"], keypair_a["pubkey"])
         gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
                                        keypair_a["nsec"])
 
         p_tags = [t for t in gift_event["tags"] if t[0] == "p"]
         assert len(p_tags) >= 1
         assert p_tags[0][1] == keypair_b["pubkey"]
+
+    def test_gift_wrap_created_at_is_backdated(self, keypair_a, keypair_b):
+        """NIP-59: gift wrap created_at must be randomized up to 2 days in the
+        past (privacy). A real-time timestamp leaks send time and breaks
+        Nostur's subscription cursor logic.
+
+        Over several wraps the timestamps must (a) all fall within the
+        [now-2d, now] window and (b) vary — proving random backdating rather
+        than always emitting the current time.
+        """
+        now = int(time.time())
+        timestamps = []
+        for _ in range(10):
+            rumor = create_dm_rumor("x", keypair_b["pubkey"], keypair_a["pubkey"])
+            gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
+                                           keypair_a["nsec"])
+            ts = gift_event["created_at"]
+            assert now - 172800 <= ts <= now, (
+                f"gift wrap created_at {ts} outside [now-2d, now] (now={now})"
+            )
+            timestamps.append(ts)
+        # Variation proves the timestamp is randomized, not always == now.
+        assert len(set(timestamps)) > 1, (
+            "gift wrap created_at never varied across 10 wraps — not randomized"
+        )
+
+    def test_gift_wrap_has_expiration_tag(self, keypair_a, keypair_b):
+        """NIP-40 expiration tag on the gift wrap — relays prune old 1059s and
+        Nostur/Amethyst honor it. Must point to the future.
+        """
+        rumor = create_dm_rumor("test", keypair_b["pubkey"], keypair_a["pubkey"])
+        gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
+                                       keypair_a["nsec"])
+        now = int(time.time())
+        exp_tags = [t for t in gift_event["tags"] if t[0] == "expiration"]
+        assert len(exp_tags) == 1, f"expected 1 expiration tag, got {len(exp_tags)}"
+        exp_ts = int(exp_tags[0][1])
+        assert exp_ts > now, f"expiration {exp_ts} not in the future (now={now})"
+
+    def test_seal_created_at_is_backdated(self, keypair_a, keypair_b):
+        """NIP-59: the seal (kind 13) created_at must also be backdated."""
+        from plugins.platforms.nostr.crypto import nip44_decrypt
+        from pynostr.key import PrivateKey
+
+        now = int(time.time())
+        timestamps = []
+        for _ in range(10):
+            rumor = create_dm_rumor("x", keypair_b["pubkey"], keypair_a["pubkey"])
+            gift_event = create_gift_wrap(rumor, keypair_b["pubkey"],
+                                           keypair_a["nsec"])
+
+            # Decrypt the outer gift-wrap layer to recover the seal JSON.
+            recipient_priv = PrivateKey.from_nsec(keypair_b["nsec"]).hex()
+            sender_gw_pubkey = gift_event["pubkey"]
+            seal_json = nip44_decrypt(gift_event["content"], recipient_priv,
+                                       sender_gw_pubkey)
+            seal = json.loads(seal_json)
+            seal_ts = seal["created_at"]
+            assert now - 172800 <= seal_ts <= now, (
+                f"seal created_at {seal_ts} outside [now-2d, now] (now={now})"
+            )
+            timestamps.append(seal_ts)
+        assert len(set(timestamps)) > 1, (
+            "seal created_at never varied across 10 wraps — not randomized"
+        )

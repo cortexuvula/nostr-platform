@@ -86,6 +86,20 @@ class EventRouter:
 
         rumor, seal_pubkey = result
 
+        # NIP-17 security: "Clients MUST verify if pubkey of the kind:13 is
+        # the same pubkey on the kind:14, otherwise any sender can impersonate
+        # others by simply changing the pubkey on kind:14." The seal's pubkey
+        # authoritatively identifies the sender; if the rumor claims a
+        # different pubkey, this is a forgery and must be rejected.
+        rumor_pubkey = rumor.get("pubkey")
+        if rumor_pubkey and rumor_pubkey != seal_pubkey:
+            logger.warning(
+                f"Gift-wrap rumor pubkey {rumor_pubkey[:16]}... does not match "
+                f"seal pubkey {seal_pubkey[:16]}... — possible impersonation, "
+                f"dropping"
+            )
+            return
+
         content = rumor.get("content", "")
         if not content:
             logger.debug("Gift-wrap rumor has no content")

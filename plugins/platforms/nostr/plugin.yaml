@@ -42,3 +42,7 @@ optional_env:
     description: "Only accept DMs from NIP-05 verified users. Default: false"
     prompt: "Require NIP-05 verification? (true/false)"
     password: false
+  - name: NOSTR_LEGACY_DM
+    description: "Accept and reply with legacy NIP-04 (kind 4) DMs. Set false for NIP-17-only. Default: true"
+    prompt: "Enable legacy NIP-04 DMs? (true/false)"
+    password: false

@@ -17,7 +17,9 @@ import json
 import logging
 import math
 import os
+import random
 import struct
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -368,6 +370,22 @@ class EventSigner:
 # NIP-17 gift-wrap operations
 # ---------------------------------------------------------------------------
 
+# NIP-59: seal & gift-wrap timestamps are randomized up to 2 days into the
+# past to hide the real send time. Nostur's subscription cursor anchors to
+# this 2-day window (issue #85), so a real-time timestamp can confuse it.
+GIFT_WRAP_BACKDATE_MAX_DAYS = 2
+# NIP-40 expiration tag on gift wraps: relays prune old kind-1059 events and
+# Nostur/Amethyst honor the expiration. Two weeks is a sane default.
+GIFT_WRAP_EXPIRATION_SECONDS = 14 * 86400
+
+
+def _random_past_timestamp(max_days: int = GIFT_WRAP_BACKDATE_MAX_DAYS) -> int:
+    """Return a Unix timestamp randomized within the past ``max_days`` days."""
+    now = int(time.time())
+    offset = random.randint(0, max_days * 86400)
+    return now - offset
+
+
 def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
                      sender_nsec: str) -> dict:
     """Create a NIP-17 gift-wrapped event (kind 1059).
@@ -397,11 +415,13 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
         recipient_pubkey_hex,
     )
 
-    # Step 2: Create seal (kind 13) with encrypted content, signed by sender
+    # Step 2: Create seal (kind 13) with encrypted content, signed by sender.
+    # NIP-59: backdate the seal's created_at up to 2 days (privacy).
     seal = sender_signer.sign_event(
         kind=13,
         content=encrypted_rumor,
         tags=[],
+        created_at=_random_past_timestamp(),
     )
 
     # Step 3: Generate ephemeral keypair
@@ -415,12 +435,19 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
         recipient_pubkey_hex,
     )
 
-    # Step 5: Create gift-wrap (kind 1059) signed with ephemeral key
+    # Step 5: Create gift-wrap (kind 1059) signed with ephemeral key.
+    # NIP-59: backdate the created_at. NIP-40: add an expiration tag so
+    # relays prune the wrap after delivery and clients honor disappearing DMs.
+    gw_tags = [
+        ["p", recipient_pubkey_hex],
+        ["expiration", str(int(time.time()) + GIFT_WRAP_EXPIRATION_SECONDS)],
+    ]
     ephemeral_signer = EventSigner(ephemeral_key.bech32())
     gift_wrap = ephemeral_signer.sign_event(
         kind=1059,
         content=encrypted_seal,
-        tags=[["p", recipient_pubkey_hex]],
+        tags=gw_tags,
+        created_at=_random_past_timestamp(),
     )
 
     return gift_wrap
@@ -514,11 +541,26 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     return (rumor, seal_pubkey)
 
 
-def create_dm_rumor(content: str, recipient_pubkey_hex: str) -> dict:
-    """Create a NIP-17 chat message rumor (kind 14 per NIP-17 spec)."""
+def create_dm_rumor(content: str, recipient_pubkey_hex: str,
+                    sender_pubkey_hex: str) -> dict:
+    """Create a NIP-17 chat message rumor (kind 14 per NIP-17 spec).
+
+    Per NIP-17 the rumor MUST carry the sender's real ``pubkey`` (it is
+    not signed, but the recipient verifies ``rumor.pubkey == seal.pubkey``
+    to prevent impersonation). ``id`` and ``sig`` are present but empty
+    because the rumor is unsigned by design — deniability.
+
+    ``created_at`` is set to the current Unix timestamp so the rumor
+    carries a valid time even though it is encrypted inside the seal
+    (which has its own timestamp).  Some relays and clients reject or
+    deprioritize events with a zero timestamp.
+    """
     return {
         "kind": 14,
         "content": content,
         "tags": [["p", recipient_pubkey_hex]],
-        "created_at": 0,
+        "created_at": int(time.time()),
+        "id": "",
+        "pubkey": sender_pubkey_hex,
+        "sig": "",
     }

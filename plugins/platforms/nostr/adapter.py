@@ -26,9 +26,14 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Persistence paths for state that must survive gateway restarts.
+_HERMES_DIR = Path.home() / ".hermes"
+_LEGACY_PEERS_FILE = _HERMES_DIR / "nostr_legacy_peers.json"
 
 try:
     from pynostr.key import PrivateKey, PublicKey
@@ -53,6 +58,7 @@ from .crypto import (
     EventSigner,
     create_gift_wrap,
     create_dm_rumor,
+    derive_pubkey,
     nip04_encrypt,
     npub_to_hex,
     hex_to_npub,
@@ -204,7 +210,120 @@ class NostrAdapter(BasePlatformAdapter):
         # Pubkeys that have sent us legacy NIP-04 (kind 4) DMs. Replies to
         # these peers use nip04_encrypt so legacy-only clients can read them;
         # everyone else gets NIP-17 gift-wrapped replies.
-        self._legacy_peers: set[str] = set()
+        self._legacy_peers: set[str] = self._load_legacy_peers()
+        # Cache of recipient pubkey → (relay_urls, fetched_at) so we don't
+        # re-query kind 10050 on every reply to the same peer. TTL-bounded.
+        self._recipient_relay_cache: dict[str, tuple[list, float]] = {}
+        self._recipient_relay_ttl = 600.0  # 10 minutes
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load_legacy_peers(self) -> set[str]:
+        """Load legacy NIP-04 peers from disk so state survives restarts."""
+        try:
+            if _LEGACY_PEERS_FILE.exists():
+                data = json.loads(_LEGACY_PEERS_FILE.read_text())
+                return set(data.get("peers", []))
+        except Exception as e:
+            logger.debug(f"Could not load legacy peers: {e}")
+        return set()
+
+    def _save_legacy_peers(self):
+        """Persist legacy NIP-04 peers to disk."""
+        try:
+            _HERMES_DIR.mkdir(parents=True, exist_ok=True)
+            _LEGACY_PEERS_FILE.write_text(
+                json.dumps({"peers": list(self._legacy_peers)})
+            )
+        except Exception as e:
+            logger.warning(f"Could not save legacy peers: {e}")
+
+    # ------------------------------------------------------------------
+    # NIP-17 relay list publication
+    # ------------------------------------------------------------------
+
+    async def _publish_dm_relays(self):
+        """Publish kind 10050 (NIP-17 DM relay list) so clients know where
+        to send gift-wrapped DMs to us.
+
+        Per NIP-17, the event contains ``["relay", url]`` tags for each
+        relay we monitor for incoming DMs. Without this event, clients
+        like Jumble and Amethyst cannot determine where to send replies
+        and will report "user has not set up DM relays."
+        """
+        if not self._signer or not self.relay_urls:
+            return
+
+        tags = [["relay", url] for url in self.relay_urls]
+        event = self._signer.sign_event(
+            kind=10050,
+            content="",
+            tags=tags,
+        )
+        try:
+            results = await self.relay_pool.publish(event, timeout=5.0)
+            accepted = sum(1 for r in results.values() if r.get("accepted"))
+            logger.info(
+                f"Published kind 10050 DM relay list to {accepted}/"
+                f"{len(results)} relays ({len(self.relay_urls)} relays listed)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish DM relay list: {e}")
+
+    # ------------------------------------------------------------------
+    # Recipient relay discovery (NIP-17 / NIP-65 cascade)
+    # ------------------------------------------------------------------
+
+    async def _resolve_recipient_relays(self, pubkey: str) -> list[str]:
+        """Discover where a recipient listens for gift-wrapped DMs.
+
+        Mirrors Amethyst's documented cascade
+        (PR #2531): kind 10050 (DM relay list) → kind 10002 read relays →
+        [] (caller falls back to own relays). Cached per-pubkey with a TTL
+        so repeated replies to the same peer don't re-query relays.
+        """
+        cached = self._recipient_relay_cache.get(pubkey)
+        if cached and time.time() - cached[1] < self._recipient_relay_ttl:
+            return cached[0]
+
+        relays: list[str] = []
+        try:
+            # 1. NIP-17 kind 10050: dedicated DM inbox relays.
+            events = await self.relay_pool.query(
+                {"kinds": [10050], "authors": [pubkey], "limit": 1},
+                timeout=5.0,
+            )
+            for ev in events:
+                for tag in ev.get("tags", []):
+                    if (isinstance(tag, list) and len(tag) >= 2
+                            and tag[0] == "relay" and tag[1]):
+                        relays.append(tag[1])
+        except Exception as e:
+            logger.debug(f"kind 10050 query failed for {pubkey[:12]}...: {e}")
+
+        if not relays:
+            try:
+                # 2. NIP-65 kind 10002: general relay list, read/both relays.
+                events = await self.relay_pool.query(
+                    {"kinds": [10002], "authors": [pubkey], "limit": 1},
+                    timeout=5.0,
+                )
+                for ev in events:
+                    for tag in ev.get("tags", []):
+                        if (isinstance(tag, list) and len(tag) >= 2
+                                and tag[0] == "r" and tag[1]):
+                            marker = tag[2] if len(tag) > 2 else ""
+                            # "read" or no marker = inbox-eligible.
+                            if marker in ("", "read"):
+                                relays.append(tag[1])
+            except Exception as e:
+                logger.debug(f"kind 10002 query failed for {pubkey[:12]}...: {e}")
+
+        relays = list(dict.fromkeys(relays))  # dedup, preserve order
+        self._recipient_relay_cache[pubkey] = (relays, time.time())
+        return relays
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter implementation
@@ -263,6 +382,10 @@ class NostrAdapter(BasePlatformAdapter):
 
         await self.relay_pool.subscribe(filters)
 
+        # Publish our DM relay list (NIP-17 kind 10050) so clients like
+        # Jumble and Amethyst know where to send gift-wrapped DMs to us.
+        await self._publish_dm_relays()
+
         self._running = True
         self._listen_task = asyncio.create_task(self._listen_loop())
         logger.info(
@@ -281,6 +404,7 @@ class NostrAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         await self.relay_pool.disconnect()
+        await self.profiles.close()
         logger.info("Nostr: disconnected")
 
     async def _listen_loop(self):
@@ -333,6 +457,7 @@ class NostrAdapter(BasePlatformAdapter):
         # A legacy (NIP-04) client cannot read NIP-17 gift-wraps and vice versa.
         if dm_protocol == "nip04":
             self._legacy_peers.add(sender_pubkey)
+            self._save_legacy_peers()
 
         # Get sender display name
         sender_name = self.profiles.get_display_name(sender_pubkey)
@@ -460,10 +585,27 @@ class NostrAdapter(BasePlatformAdapter):
                     content=content,
                     tags=[["p", recipient]],
                 )
+                await self.relay_pool.publish(dm_event)
             else:
-                rumor = create_dm_rumor(msg_text, recipient)
-                dm_event = create_gift_wrap(rumor, recipient, self.nsec)
-            await self.relay_pool.publish(dm_event)
+                # NIP-17 gift-wrapped DM. The rumor is reused for both the
+                # recipient's copy and our self-copy (identical content, two
+                # separate gift wraps p-tagged to each recipient).
+                rumor = create_dm_rumor(msg_text, recipient, self.pubkey)
+
+                # Recipient's copy: gift-wrap to them, publish to where THEY
+                # listen (their kind 10050 / 10002 inbox relays). Without this,
+                # the wrap lands only on our relays and is silently missed.
+                recipient_event = create_gift_wrap(rumor, recipient, self.nsec)
+                recipient_relays = await self._resolve_recipient_relays(recipient)
+                target_urls = recipient_relays or self.relay_urls
+                await self.relay_pool.publish_to(recipient_event, target_urls)
+
+                # Self-copy: gift-wrap the same rumor to OUR pubkey, publish to
+                # our own relays so the message shows up in our sent history
+                # across clients (Amethyst/Nostur/Jumble all rely on this).
+                self_event = create_gift_wrap(rumor, self.pubkey, self.nsec)
+                await self.relay_pool.publish(self_event)
+                dm_event = recipient_event
             return SendResult(
                 success=True,
                 message_id=dm_event.get("id"),
@@ -526,6 +668,44 @@ def register(ctx):
     )
 
 
+async def _query_recipient_relays(pool: "RelayPool", pubkey: str) -> list[str]:
+    """Standalone relay discovery: kind 10050 → kind 10002 read relays.
+
+    Shared between the adapter (which caches) and the standalone sender
+    (one-shot). Returns [] when the recipient has published no relay list,
+    in which case the caller falls back to its own configured relays.
+    """
+    relays: list[str] = []
+    try:
+        events = await pool.query(
+            {"kinds": [10050], "authors": [pubkey], "limit": 1},
+            timeout=5.0,
+        )
+        for ev in events:
+            for tag in ev.get("tags", []):
+                if (isinstance(tag, list) and len(tag) >= 2
+                        and tag[0] == "relay" and tag[1]):
+                    relays.append(tag[1])
+    except Exception:
+        pass
+    if not relays:
+        try:
+            events = await pool.query(
+                {"kinds": [10002], "authors": [pubkey], "limit": 1},
+                timeout=5.0,
+            )
+            for ev in events:
+                for tag in ev.get("tags", []):
+                    if (isinstance(tag, list) and len(tag) >= 2
+                            and tag[0] == "r" and tag[1]):
+                        marker = tag[2] if len(tag) > 2 else ""
+                        if marker in ("", "read"):
+                            relays.append(tag[1])
+        except Exception:
+            pass
+    return list(dict.fromkeys(relays))
+
+
 async def _standalone_send_async(
     pconfig,
     chat_id: str,
@@ -556,6 +736,8 @@ async def _standalone_send_async(
         if recipient.startswith("npub1"):
             recipient = _npub_to_hex(recipient)
 
+        our_pubkey = derive_pubkey(nsec)
+
         pool = RelayPool(relay_urls)
         # Use the full connect() (not connect_only) so per-relay listen loops
         # run and publish() can actually await OK frames. connect_only() opens
@@ -563,11 +745,21 @@ async def _standalone_send_async(
         # relay processes it and OK responses are never received.
         await pool.connect()
 
-        rumor = create_dm_rumor(message, recipient)
+        rumor = create_dm_rumor(message, recipient, our_pubkey)
         gift_event = create_gift_wrap(rumor, recipient, nsec)
+
+        # Discover the recipient's DM inbox relays (kind 10050 → 10002) so the
+        # gift wrap reaches where they actually listen. Falls back to our own
+        # configured relays when no recipient relay list is published.
+        recipient_relays = await _query_recipient_relays(pool, recipient)
+        target_urls = recipient_relays or relay_urls
+
+        # Self-copy: identical rumor, wrapped to ourselves, published to our own
+        # relays so sent messages appear in our DM history across clients.
+        self_event = create_gift_wrap(rumor, our_pubkey, nsec)
+
         try:
-            results = await pool.publish(gift_event, timeout=5.0)
-            # publish() returns {} if no relay acknowledged within the timeout.
+            results = await pool.publish_to(gift_event, target_urls, timeout=5.0)
             accepted = any(r.get("accepted") for r in results.values())
             if not results or not accepted:
                 urls = ", ".join(results.keys()) or "(no responses)"
@@ -575,6 +767,11 @@ async def _standalone_send_async(
                     "error": f"No relay accepted the event ({urls})",
                     "message_id": gift_event.get("id"),
                 }
+            # Best-effort self-copy; its failure doesn't fail the send.
+            try:
+                await pool.publish(self_event, timeout=5.0)
+            except Exception as e:
+                logger.debug(f"Standalone self-copy publish failed: {e}")
             return {"success": True, "message_id": gift_event.get("id")}
         finally:
             await pool.disconnect()

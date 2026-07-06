@@ -309,8 +309,21 @@ class RelayPool:
             logger.info(f"Relay {conn.url} NOTICE: {msg}")
 
         elif msg_type == "CLOSED":
+            sub_id = message[1] if len(message) > 1 else ""
             msg = message[2] if len(message) > 2 else ""
-            logger.debug(f"Relay {conn.url} CLOSED: {msg}")
+            logger.info(f"Relay {conn.url} CLOSED sub {sub_id}: {msg}")
+
+            # If the relay closed a subscription (e.g. "auth-required"),
+            # resubscribe after a short delay so we don't permanently lose
+            # events from this relay. Only resubscribe if the pool is still
+            # running and the subscription is still active.
+            if self._running and sub_id:
+                for f, sid in self._subscriptions:
+                    if sid == sub_id:
+                        asyncio.create_task(
+                            self._resubscribe_after(conn, f, sub_id, msg)
+                        )
+                        break
 
     async def subscribe(self, filters: list[dict]) -> list[str]:
         """Send REQ messages to all connected relays.
@@ -336,13 +349,62 @@ class RelayPool:
         req = json.dumps(["REQ", sub_id, filter_dict])
         await conn.send_raw(req)
 
-    async def publish(self, event: dict, timeout: float = 5.0) -> dict:
+    async def _resubscribe_after(self, conn: RelayConnection,
+                                 filter_dict: dict, sub_id: str,
+                                 reason: str, max_retries: int = 5):
+        """Resubscribe to a closed subscription after a backoff delay.
+
+        Relays like ``nostr.wine`` and ``eden.nostr.land`` close
+        subscriptions with ``auth-required`` — this gives the client time
+        to authenticate (which our relay pool doesn't currently do) and
+        then retries the REQ.  Backoff: 5s, 10s, 20s, 40s, 60s cap.
+
+        After ``max_retries`` attempts the subscription is abandoned for
+        this relay; the relay's ``_connect_and_listen`` loop will
+        resubscribe on the next reconnect cycle anyway.
+        """
+        for attempt in range(1, max_retries + 1):
+            if not self._running or not conn.connected:
+                return
+            delay = min(5 * (2 ** (attempt - 1)), 60)
+            logger.info(
+                f"Resubscribing to {conn.url} for sub {sub_id} "
+                f"({reason}) in {delay}s (attempt {attempt}/{max_retries})"
+            )
+            await asyncio.sleep(delay)
+            if not self._running or not conn.connected:
+                return
+            # Check the subscription hasn't been removed (e.g. pool disconnect).
+            if not any(sid == sub_id for _, sid in self._subscriptions):
+                return
+            try:
+                await self._send_subscription(conn, filter_dict, sub_id=sub_id)
+                logger.info(
+                    f"Resubscribed to {conn.url} for sub {sub_id} "
+                    f"(attempt {attempt})"
+                )
+                return  # Sent successfully — relay will EVENT or CLOSED again
+            except Exception as e:
+                logger.warning(
+                    f"Resubscribe attempt {attempt} to {conn.url} failed: {e}"
+                )
+        logger.warning(
+            f"Gave up resubscribing to {conn.url} for sub {sub_id} "
+            f"after {max_retries} attempts"
+        )
+
+    async def publish(self, event: dict, timeout: float = 5.0,
+                      only_urls: Optional[list] = None) -> dict:
         """Publish an event to all connected relays and await OK frames.
 
         Returns ``{url: {"accepted": bool, "message": str}}`` for each relay
         that responded within *timeout*. Relays that don't respond are
         omitted from the result. The caller can check ``any(r["accepted"]
         for r in results.values())`` to confirm at least one acceptance.
+
+        If *only_urls* is given, only pool connections whose URL is in the
+        set are targeted — used by ``publish_to`` to deliver a gift wrap to
+        a recipient's specific inbox relays that happen to be in our pool.
         """
         event_id = event.get("id", "")
         publish_msg = json.dumps(["EVENT", event])
@@ -352,6 +414,9 @@ class RelayPool:
         # arriving OK resolves every group's matching future (no clobbering).
         relay_futures: dict[str, asyncio.Future] = {}
         targets = [c for c in self.connections.values() if c.connected]
+        if only_urls is not None:
+            only_set = set(only_urls)
+            targets = [c for c in targets if c.url in only_set]
         loop = asyncio.get_running_loop()
         for conn in targets:
             fut = loop.create_future()
@@ -403,6 +468,80 @@ class RelayPool:
             for fut in relay_futures.values():
                 if not fut.done():
                     fut.cancel()
+
+    async def _publish_once(self, url: str, event: dict,
+                             timeout: float = 5.0) -> dict:
+        """Open a one-off connection to *url*, publish *event*, await OK.
+
+        Self-contained: does NOT route through the pool's listen-task /
+        ``_handle_message`` machinery, so it works for relays outside the
+        pool. Opens a WebSocket, sends EVENT, reads frames until an OK for
+        our event_id arrives or the timeout elapses, then closes. Returns
+        ``{"accepted": bool, "message": str}``.
+        """
+        event_id = event.get("id", "")
+        publish_msg = json.dumps(["EVENT", event])
+        conn = RelayConnection(url)
+        try:
+            success = await conn.connect()
+            if not success:
+                return {"accepted": False, "message": "connect failed"}
+            await conn.send_raw(publish_msg)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(conn.ws.recv(),
+                                                  timeout=deadline - time.time())
+                except asyncio.TimeoutError:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (isinstance(msg, list) and len(msg) >= 3
+                        and msg[0] == "OK" and msg[1] == event_id):
+                    return {"accepted": bool(msg[2]),
+                            "message": msg[3] if len(msg) > 3 else ""}
+            return {"accepted": False, "message": "timeout"}
+        except Exception as e:
+            return {"accepted": False, "message": f"error: {e}"}
+        finally:
+            try:
+                await conn.disconnect()
+            except Exception:
+                pass
+
+    async def publish_to(self, event: dict, urls: list,
+                          timeout: float = 5.0) -> dict:
+        """Publish *event* to a specific set of relay *urls*.
+
+        URLs that are already pool members go through ``publish`` (reusing
+        existing connections and listen-task OK routing); URLs not in the
+        pool are handled by concurrent ``_publish_once`` one-off connections.
+        Returns ``{url: {"accepted": "message"}}`` for every URL attempted.
+
+        This is the NIP-17 recipient-relay-delivery path: the caller passes
+        the recipient's kind-10050 inbox relays so the gift wrap reaches
+        where the recipient actually listens.
+        """
+        if not urls:
+            return {}
+        pool_urls = {c.url for c in self.connections.values() if c.connected}
+        in_pool = [u for u in urls if u in pool_urls]
+        external = [u for u in urls if u not in pool_urls]
+
+        results: dict[str, dict] = {}
+        if in_pool:
+            results.update(await self.publish(event, timeout=timeout,
+                                               only_urls=in_pool))
+        if external:
+            ext_results = await asyncio.gather(
+                *(self._publish_once(u, event, timeout=timeout)
+                  for u in external)
+            )
+            for url, res in zip(external, ext_results):
+                results[url] = res
+        return results
 
     async def events(self) -> AsyncGenerator[tuple[dict, str], None]:
         """Async generator yielding (event_dict, relay_url) tuples."""

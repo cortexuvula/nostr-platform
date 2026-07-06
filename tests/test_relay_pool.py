@@ -176,6 +176,58 @@ class TestPublishRouting:
         assert r2.get(conn.url, {}).get("accepted") is True
 
 
+class TestPublishTargeting:
+    """Test publish(only_urls=...) and publish_to() for recipient-relay delivery."""
+
+    async def test_publish_only_urls_restricts_targets(self):
+        """publish(only_urls=[...]) must send only to listed relays."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        conn1 = RelayConnection("wss://r1.example.com"); conn1.connected = True
+        conn2 = RelayConnection("wss://r2.example.com"); conn2.connected = True
+        conn3 = RelayConnection("wss://r3.example.com"); conn3.connected = True
+        for c in (conn1, conn2, conn3):
+            pool.connections[c.url] = c
+            c.send_raw = AsyncMock()
+
+        event = {"id": "filter123", "kind": 1}
+        results = await pool.publish(event, timeout=0.3,
+                                      only_urls=["wss://r2.example.com"])
+        # Only conn2 was sent the EVENT.
+        conn1.send_raw.assert_not_called()
+        conn2.send_raw.assert_awaited()
+        conn3.send_raw.assert_not_called()
+
+    async def test_publish_to_pool_relays_only(self):
+        """publish_to() routes pool-member URLs through publish()."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        conn = RelayConnection("wss://pool.example.com"); conn.connected = True
+        pool.connections[conn.url] = conn
+
+        async def feed_ok():
+            await asyncio.sleep(0)
+            await pool._handle_message(conn, ["OK", "pt1", True, ""])
+        feed_task = asyncio.create_task(feed_ok())
+        results = await pool.publish_to({"id": "pt1", "kind": 1},
+                                         ["wss://pool.example.com"])
+        await feed_task
+        assert "wss://pool.example.com" in results
+        assert results["wss://pool.example.com"]["accepted"] is True
+
+    async def test_publish_to_falls_back_when_no_pool_relays(self):
+        """When recipient relays aren't in the pool, publish_to attempts a
+        one-off connection to each (which fails for unreachable URLs)."""
+        pool = RelayPool([])
+        # No pool connections — every URL is external.
+        results = await pool.publish_to({"id": "pt2", "kind": 1},
+                                         ["wss://not-in-pool.example.com"],
+                                         timeout=0.3)
+        # The URL is in the result with a failure status (connect failed).
+        assert "wss://not-in-pool.example.com" in results
+        assert results["wss://not-in-pool.example.com"]["accepted"] is False
+
+
 class TestQueryRouting:
     """Test query() collects events and stops at EOSE."""
 

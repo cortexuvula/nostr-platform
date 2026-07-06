@@ -194,6 +194,8 @@ class TestSendRouting:
             adapter = NostrAdapter(config)
         adapter.relay_pool = MagicMock()
         adapter.relay_pool.publish = AsyncMock()
+        adapter.relay_pool.publish_to = AsyncMock()
+        adapter._resolve_recipient_relays = AsyncMock(return_value=[])
         return adapter
 
     async def test_dm_send_gift_wraps_to_chat_id(self, mock_env, monkeypatch):
@@ -201,8 +203,9 @@ class TestSendRouting:
         adapter = self._make_adapter(mock_env, monkeypatch)
         recipient = PrivateKey().public_key.hex()
         await adapter.send(chat_id=recipient, content="hello")
-        adapter.relay_pool.publish.assert_awaited_once()
-        gift_event = adapter.relay_pool.publish.await_args.args[0]
+        # Recipient gift wrap goes out via publish_to.
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        gift_event = adapter.relay_pool.publish_to.await_args.args[0]
         assert gift_event["kind"] == 1059
         # p tag must address the recipient pubkey, not arbitrary text.
         p_tags = [t for t in gift_event["tags"] if t[0] == "p"]
@@ -218,8 +221,8 @@ class TestSendRouting:
             content="hi",
             metadata={"thread_id": "note_abc"},
         )
-        adapter.relay_pool.publish.assert_awaited_once()
-        gift_event = adapter.relay_pool.publish.await_args.args[0]
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        gift_event = adapter.relay_pool.publish_to.await_args.args[0]
         assert gift_event["kind"] == 1059
         p_tags = [t for t in gift_event["tags"] if t[0] == "p"]
         assert p_tags[0][1] == author  # DM to the author, NOT the note id
@@ -265,7 +268,7 @@ class TestSendRouting:
         adapter = self._make_adapter(mock_env, monkeypatch)
         peer = PrivateKey().public_key.hex()
         await adapter.send(chat_id=peer, content="hi")
-        event = adapter.relay_pool.publish.await_args.args[0]
+        event = adapter.relay_pool.publish_to.await_args.args[0]
         assert event["kind"] == 1059
 
 
@@ -314,3 +317,178 @@ class TestStandaloneSendSignature:
         # Must return the relays-missing error, NOT an AttributeError-derived
         # "standalone send failed" error (which is what the bug produced).
         assert result.get("error") == "NOSTR_RELAYS not set"
+
+    async def test_standalone_publishes_to_recipient_and_self(
+        self, mock_env, monkeypatch
+    ):
+        """Standalone sender must publish a recipient-targeted gift wrap (via
+        publish_to) AND a self-copy (via publish), matching adapter.send()."""
+        from plugins.platforms.nostr.adapter import _standalone_send_async
+
+        sk = PrivateKey()
+        nsec = sk.bech32()
+        recipient = PrivateKey().public_key.hex()
+        monkeypatch.setenv("NOSTR_NSEC", nsec)
+        monkeypatch.setenv("NOSTR_RELAYS", "wss://own.relay")
+
+        # Fake RelayPool: capture publish_to / publish, return [] from query
+        # (no recipient 10050 → falls back to own relays).
+        fake_pool = MagicMock()
+        fake_pool.connect = AsyncMock()
+        fake_pool.disconnect = AsyncMock()
+        fake_pool.query = AsyncMock(return_value=[])
+        fake_pool.publish_to = AsyncMock(
+            return_value={"wss://own.relay": {"accepted": True}}
+        )
+        fake_pool.publish = AsyncMock(
+            return_value={"wss://own.relay": {"accepted": True}}
+        )
+        with patch(
+            "plugins.platforms.nostr.adapter.RelayPool",
+            return_value=fake_pool,
+        ):
+            result = await _standalone_send_async(
+                MagicMock(), recipient, "hello",
+                thread_id=None, media_files=None, force_document=False,
+            )
+
+        assert result.get("success") is True
+        # Recipient copy via publish_to.
+        fake_pool.publish_to.assert_awaited_once()
+        recip_event, urls = fake_pool.publish_to.await_args.args[:2]
+        assert recip_event["kind"] == 1059
+        p_tags = [t for t in recip_event["tags"] if t[0] == "p"]
+        assert p_tags[0][1] == recipient
+        # Self-copy via publish.
+        fake_pool.publish.assert_awaited_once()
+        self_event = fake_pool.publish.await_args.args[0]
+        assert self_event["kind"] == 1059
+        self_p_tags = [t for t in self_event["tags"] if t[0] == "p"]
+        assert self_p_tags[0][1] == sk.public_key.hex()
+
+
+class TestRecipientRelayDiscovery:
+    """Test _resolve_recipient_relays() — the NIP-17 recipient-relay cascade.
+
+    Without this, gift wraps are published only to the agent's own relays,
+    so recipients listening on their own kind-10050 inbox relays never see
+    the DM (silent delivery failure — the #1 'unreliable DM' cause).
+    """
+
+    def _make_adapter(self, mock_env, monkeypatch):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://own.relay"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.query = AsyncMock(return_value=[])
+        adapter.relay_pool.publish = AsyncMock()
+        adapter.relay_pool.publish_to = AsyncMock()
+        return adapter
+
+    async def test_resolves_kind_10050_relays(self, mock_env, monkeypatch):
+        """A kind 10050 event with relay tags → those URLs returned."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        adapter.relay_pool.query.return_value = [{
+            "kind": 10050,
+            "tags": [["relay", "wss://peer-inbox1.com"],
+                     ["relay", "wss://peer-inbox2.com"]],
+        }]
+        relays = await adapter._resolve_recipient_relays(peer)
+        assert set(relays) == {"wss://peer-inbox1.com",
+                                "wss://peer-inbox2.com"}
+
+    async def test_falls_back_to_kind_10002_read_relays(self, mock_env, monkeypatch):
+        """No kind 10050 → query kind 10002, use read/unmarked relays."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        # First query (kind 10050) returns nothing; second (kind 10002) returns
+        # a read relay and a write relay.
+        adapter.relay_pool.query.side_effect = [
+            [],  # 10050 empty
+            [{"kind": 10002, "tags": [
+                ["r", "wss://read.relay", "read"],
+                ["r", "wss://write.relay", "write"],
+                ["r", "wss://both.relay"],  # no marker = both
+            ]}],
+        ]
+        relays = await adapter._resolve_recipient_relays(peer)
+        assert "wss://read.relay" in relays
+        assert "wss://both.relay" in relays
+        assert "wss://write.relay" not in relays
+
+    async def test_returns_empty_when_no_relay_lists(self, mock_env, monkeypatch):
+        """No 10050 and no 10002 → [] (caller falls back to own relays)."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        adapter.relay_pool.query.return_value = []
+        relays = await adapter._resolve_recipient_relays(peer)
+        assert relays == []
+
+    async def test_caches_result_within_ttl(self, mock_env, monkeypatch):
+        """Second call for same pubkey must not re-query the relay."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        adapter.relay_pool.query.return_value = [{
+            "kind": 10050, "tags": [["relay", "wss://cached.relay"]],
+        }]
+        await adapter._resolve_recipient_relays(peer)
+        await adapter._resolve_recipient_relays(peer)
+        assert adapter.relay_pool.query.await_count == 1
+
+
+class TestSelfCopyGiftWrap:
+    """Test that send() publishes BOTH a recipient-targeted gift wrap AND a
+    self-copy to the agent's own relays (so sent history appears in clients)."""
+
+    def _make_adapter(self, mock_env, monkeypatch):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://own.relay"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.query = AsyncMock(return_value=[])
+        adapter.relay_pool.publish = AsyncMock()
+        adapter.relay_pool.publish_to = AsyncMock()
+        # Patch recipient relay resolution to a known set.
+        adapter._resolve_recipient_relays = AsyncMock(
+            return_value=["wss://peer-inbox.com"]
+        )
+        return adapter
+
+    async def test_send_publishes_to_recipient_relays(self, mock_env, monkeypatch):
+        """send() must call publish_to with the recipient's relays, not own."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        await adapter.send(chat_id=peer, content="hello")
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        event, urls = adapter.relay_pool.publish_to.await_args.args[:2]
+        assert urls == ["wss://peer-inbox.com"]
+        assert event["kind"] == 1059
+        p_tags = [t for t in event["tags"] if t[0] == "p"]
+        assert p_tags[0][1] == peer
+
+    async def test_send_publishes_self_copy(self, mock_env, monkeypatch):
+        """send() must also publish a self-copy (p-tagged to our pubkey)."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        await adapter.send(chat_id=peer, content="hello")
+        adapter.relay_pool.publish.assert_awaited_once()
+        self_event = adapter.relay_pool.publish.await_args.args[0]
+        assert self_event["kind"] == 1059
+        p_tags = [t for t in self_event["tags"] if t[0] == "p"]
+        assert p_tags[0][1] == adapter.pubkey  # addressed to us (self-copy)
+
+    async def test_send_unknown_recipient_uses_own_relays(self, mock_env, monkeypatch):
+        """When recipient has no known relays, publish_to gets own relays."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter._resolve_recipient_relays = AsyncMock(return_value=[])
+        peer = PrivateKey().public_key.hex()
+        await adapter.send(chat_id=peer, content="hello")
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        _, urls = adapter.relay_pool.publish_to.await_args.args[:2]
+        assert urls == ["wss://own.relay"]
+
