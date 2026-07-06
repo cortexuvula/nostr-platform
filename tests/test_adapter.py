@@ -502,3 +502,116 @@ class TestSelfCopyGiftWrap:
         _, urls = adapter.relay_pool.publish_to.await_args.args[:2]
         assert urls == ["wss://own.relay"]
 
+
+class TestHandleDmAuthorization:
+    """Cover the security-critical _handle_dm authorization + NIP-05 paths
+    (adapter.py:445-490) — these were previously at 0% test coverage."""
+
+    def _make_adapter(self, mock_env, monkeypatch, require_nip05=False):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://r.example.com"],
+                         "require_nip05": require_nip05}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        # Stub gateway-base methods so _handle_dm can run end-to-end.
+        adapter.handle_message = AsyncMock()
+        adapter.build_source = MagicMock(return_value={"chat_id": "src"})
+        return adapter
+
+    async def test_unauthorized_dm_dropped(self, mock_env, monkeypatch):
+        """A DM from a pubkey not in allowed_users (and allow_all=False) is
+        dropped — handle_message must NOT be called."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        stranger = PrivateKey().public_key.hex()
+        await adapter._handle_dm(stranger, "hello", {"id": "ev1"})
+        adapter.handle_message.assert_not_called()
+
+    async def test_allowed_user_dm_dispatched(self, mock_env, monkeypatch):
+        """A DM from an allowed user is dispatched to handle_message."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        allowed = PrivateKey().public_key.hex()
+        adapter.allowed_users.add(allowed)
+        await adapter._handle_dm(allowed, "hello", {"id": "ev1"})
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_allow_all_accepts_anyone(self, mock_env, monkeypatch):
+        """With allow_all=True, any pubkey is accepted."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.allow_all = True
+        stranger = PrivateKey().public_key.hex()
+        await adapter._handle_dm(stranger, "hello", {"id": "ev1"})
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_nip05_required_blocks_unverified(self, mock_env, monkeypatch):
+        """With require_nip05=True, a sender with no verified nip05 is dropped."""
+        adapter = self._make_adapter(mock_env, monkeypatch, require_nip05=True)
+        adapter.allowed_users.add(PrivateKey().public_key.hex())
+        # Mock get_profile to return a profile with no nip05.
+        allowed = next(iter(adapter.allowed_users))
+        adapter.profiles.get_profile = AsyncMock(
+            return_value={"name": "x", "nip05": None}
+        )
+        await adapter._handle_dm(allowed, "hello", {"id": "ev1"})
+        adapter.handle_message.assert_not_called()
+
+    async def test_nip05_required_accepts_verified(self, mock_env, monkeypatch):
+        """With require_nip05=True, a sender with a verified nip05 is accepted."""
+        adapter = self._make_adapter(mock_env, monkeypatch, require_nip05=True)
+        allowed = PrivateKey().public_key.hex()
+        adapter.allowed_users.add(allowed)
+        adapter.profiles.get_profile = AsyncMock(
+            return_value={"name": "x", "nip05": "x@example.com"}
+        )
+        await adapter._handle_dm(allowed, "hello", {"id": "ev1"})
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_legacy_dm_peer_recorded(self, mock_env, monkeypatch):
+        """A DM arriving via NIP-04 (dm_protocol='nip04') records the sender
+        in _legacy_peers so replies use kind 4."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        allowed = PrivateKey().public_key.hex()
+        adapter.allowed_users.add(allowed)
+        # Avoid touching disk for the save.
+        adapter._save_legacy_peers = MagicMock()
+        await adapter._handle_dm(allowed, "hi", {"id": "ev1"}, dm_protocol="nip04")
+        assert allowed in adapter._legacy_peers
+        adapter._save_legacy_peers.assert_called_once()
+
+
+class TestHandleMentionAuthorization:
+    """Cover _handle_mention authorization (adapter.py:494-525)."""
+
+    def _make_adapter(self, mock_env, monkeypatch):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://r.example.com"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.handle_message = AsyncMock()
+        adapter.build_source = MagicMock(return_value={"chat_id": "src"})
+        return adapter
+
+    async def test_unauthorized_mention_dropped(self, mock_env, monkeypatch):
+        """A mention from a non-allowed pubkey is dropped."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        stranger = PrivateKey().public_key.hex()
+        await adapter._handle_mention(
+            {"pubkey": stranger, "content": "hi", "id": "n1"}
+        )
+        adapter.handle_message.assert_not_called()
+
+    async def test_allowed_mention_dispatched(self, mock_env, monkeypatch):
+        """A mention from an allowed pubkey is dispatched with thread_id=note."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        allowed = PrivateKey().public_key.hex()
+        adapter.allowed_users.add(allowed)
+        await adapter._handle_mention(
+            {"pubkey": allowed, "content": "hi", "id": "note_xyz"}
+        )
+        adapter.handle_message.assert_awaited_once()
+        # build_source must have been called with thread_id=note_xyz.
+        _, kwargs = adapter.build_source.call_args
+        assert kwargs.get("thread_id") == "note_xyz"
+
+
