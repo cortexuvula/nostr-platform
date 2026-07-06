@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # Persistence paths for state that must survive gateway restarts.
 _HERMES_DIR = Path.home() / ".hermes"
 _LEGACY_PEERS_FILE = _HERMES_DIR / "nostr_legacy_peers.json"
+# Jumble encryption keypair — persistent so recipients who learned it from
+# our kind 10044 can keep decrypting across restarts.
+_ENC_KEY_FILE = _HERMES_DIR / "nostr_encryption_key.json"
 
 try:
     from pynostr.key import PrivateKey, PublicKey
@@ -57,11 +60,15 @@ from .profile_cache import ProfileCache
 from .crypto import (
     EventSigner,
     create_gift_wrap,
+    create_jumble_gift_wrap,
     create_dm_rumor,
+    create_encryption_key_event,
     derive_pubkey,
+    generate_encryption_keypair,
     nip04_encrypt,
     npub_to_hex,
     hex_to_npub,
+    parse_encryption_pubkey,
 )
 
 
@@ -219,6 +226,31 @@ class NostrAdapter(BasePlatformAdapter):
         # re-query kind 10050 on every reply to the same peer. TTL-bounded.
         self._recipient_relay_cache: dict[str, tuple[list, float]] = {}
         self._recipient_relay_ttl = 600.0  # 10 minutes
+        # Jumble kind-10044 encryption keypair. Persistent so Jumble users who
+        # learned our encryption pubkey can keep decrypting across restarts.
+        self._encryption_keypair: Optional[dict] = self._load_encryption_keypair()
+        # Cache of recipient main pubkey → (encryption_pubkey, fetched_at).
+        self._recipient_enc_cache: dict[str, tuple[str, float]] = {}
+
+    def _load_encryption_keypair(self) -> Optional[dict]:
+        """Load the Jumble encryption keypair from disk, or generate one."""
+        try:
+            if _ENC_KEY_FILE.exists():
+                return json.loads(_ENC_KEY_FILE.read_text())
+        except Exception as e:
+            logger.debug(f"Could not load encryption keypair: {e}")
+        # Generate and persist a fresh keypair on first run.
+        kp = generate_encryption_keypair()
+        self._save_encryption_keypair(kp)
+        return kp
+
+    def _save_encryption_keypair(self, kp: dict):
+        """Persist the encryption keypair to disk."""
+        try:
+            _HERMES_DIR.mkdir(parents=True, exist_ok=True)
+            _ENC_KEY_FILE.write_text(json.dumps(kp))
+        except Exception as e:
+            logger.warning(f"Could not save encryption keypair: {e}")
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -329,6 +361,52 @@ class NostrAdapter(BasePlatformAdapter):
         self._recipient_relay_cache[pubkey] = (relays, time.time())
         return relays
 
+    async def _resolve_recipient_encryption_pubkey(
+        self, main_pubkey: str
+    ) -> Optional[str]:
+        """Check if a recipient uses Jumble's kind-10044 encryption-keypair
+        scheme. Returns their encryption pubkey if so, else None (→ the caller
+        uses standard NIP-17). Cached per-pubkey with a TTL.
+        """
+        cached = self._recipient_enc_cache.get(main_pubkey)
+        if cached and time.time() - cached[1] < self._recipient_relay_ttl:
+            return cached[0]
+
+        enc_pubkey = None
+        try:
+            events = await self.relay_pool.query(
+                {"kinds": [10044], "authors": [main_pubkey], "limit": 1},
+                timeout=5.0,
+            )
+            for ev in events:
+                enc_pubkey = parse_encryption_pubkey(ev)
+                if enc_pubkey:
+                    break
+        except Exception as e:
+            logger.debug(f"kind 10044 query failed for {main_pubkey[:12]}...: {e}")
+
+        self._recipient_enc_cache[main_pubkey] = (enc_pubkey, time.time())
+        return enc_pubkey
+
+    async def _publish_encryption_key(self):
+        """Publish our kind 10044 encryption-key announcement so Jumble users
+        can send gift-wrapped DMs to our encryption pubkey. Called on connect
+        alongside the kind 10050 DM relay list.
+        """
+        if not self._signer or not self._encryption_keypair:
+            return
+        event = create_encryption_key_event(
+            self._encryption_keypair["pubkey_hex"], self._signer
+        )
+        try:
+            await self.relay_pool.publish(event, timeout=5.0)
+            logger.info(
+                f"Published kind 10044 encryption key "
+                f"({self._encryption_keypair['pubkey_hex'][:16]}...)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish encryption key: {e}")
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter implementation
     # ------------------------------------------------------------------
@@ -389,6 +467,9 @@ class NostrAdapter(BasePlatformAdapter):
         # Publish our DM relay list (NIP-17 kind 10050) so clients like
         # Jumble and Amethyst know where to send gift-wrapped DMs to us.
         await self._publish_dm_relays()
+        # Publish our encryption key (Jumble kind 10044) so Jumble users can
+        # send gift-wrapped DMs to our encryption pubkey.
+        await self._publish_encryption_key()
 
         self._running = True
         self._listen_task = asyncio.create_task(self._listen_loop())
@@ -596,10 +677,24 @@ class NostrAdapter(BasePlatformAdapter):
                 # separate gift wraps p-tagged to each recipient).
                 rumor = create_dm_rumor(msg_text, recipient, self.pubkey)
 
-                # Recipient's copy: gift-wrap to them, publish to where THEY
-                # listen (their kind 10050 / 10002 inbox relays). Without this,
-                # the wrap lands only on our relays and is silently missed.
-                recipient_event = create_gift_wrap(rumor, recipient, self.nsec)
+                # Detect Jumble recipients (they publish a kind 10044
+                # encryption pubkey). Jumble's decrypt only tries the
+                # encryption key, so a standard gift wrap is silently dropped.
+                recipient_enc = await self._resolve_recipient_encryption_pubkey(
+                    recipient
+                )
+                if recipient_enc and self._encryption_keypair:
+                    recipient_event = create_jumble_gift_wrap(
+                        rumor, recipient, recipient_enc, self.nsec,
+                        self._encryption_keypair["privkey_hex"],
+                    )
+                else:
+                    # Standard NIP-17 (Amethyst, Nostur, etc.).
+                    recipient_event = create_gift_wrap(rumor, recipient, self.nsec)
+
+                # Recipient's copy: publish to where THEY listen (their kind
+                # 10050 / 10002 inbox relays). Without this, the wrap lands
+                # only on our relays and is silently missed.
                 recipient_relays = await self._resolve_recipient_relays(recipient)
                 target_urls = recipient_relays or self.relay_urls
                 await self.relay_pool.publish_to(recipient_event, target_urls)
@@ -710,6 +805,39 @@ async def _query_recipient_relays(pool: "RelayPool", pubkey: str) -> list[str]:
     return list(dict.fromkeys(relays))
 
 
+async def _query_recipient_encryption_pubkey(pool: "RelayPool",
+                                              pubkey: str) -> Optional[str]:
+    """Standalone Jumble detection: query kind 10044, return the n-tag
+    encryption pubkey, or None if the recipient isn't a Jumble user."""
+    try:
+        events = await pool.query(
+            {"kinds": [10044], "authors": [pubkey], "limit": 1},
+            timeout=5.0,
+        )
+        for ev in events:
+            enc = parse_encryption_pubkey(ev)
+            if enc:
+                return enc
+    except Exception:
+        pass
+    return None
+
+
+def _load_persisted_encryption_key() -> Optional[dict]:
+    """Load the persisted Jumble encryption keypair for standalone use.
+
+    Returns None if no key has been persisted (the adapter generates one on
+    first connect; standalone runs before that will fall back to standard
+    NIP-17).
+    """
+    try:
+        if _ENC_KEY_FILE.exists():
+            return json.loads(_ENC_KEY_FILE.read_text())
+    except Exception:
+        pass
+    return None
+
+
 async def _standalone_send_async(
     pconfig,
     chat_id: str,
@@ -750,7 +878,19 @@ async def _standalone_send_async(
         await pool.connect()
 
         rumor = create_dm_rumor(message, recipient, our_pubkey)
-        gift_event = create_gift_wrap(rumor, recipient, nsec)
+
+        # Detect Jumble recipients and use their encryption-keypair format if
+        # applicable. The encryption keypair is loaded from the persisted file
+        # the adapter created; without it, fall back to standard NIP-17.
+        recipient_enc = await _query_recipient_encryption_pubkey(pool, recipient)
+        enc_kp = _load_persisted_encryption_key()
+        if recipient_enc and enc_kp:
+            gift_event = create_jumble_gift_wrap(
+                rumor, recipient, recipient_enc, nsec,
+                enc_kp["privkey_hex"],
+            )
+        else:
+            gift_event = create_gift_wrap(rumor, recipient, nsec)
 
         # Discover the recipient's DM inbox relays (kind 10050 → 10002) so the
         # gift wrap reaches where they actually listen. Falls back to our own

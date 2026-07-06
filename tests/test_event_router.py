@@ -42,6 +42,8 @@ def mock_adapter():
     adapter._handle_mention = AsyncMock()
     adapter.profiles = MagicMock()
     adapter.profiles.update_from_event = AsyncMock()
+    # No Jumble encryption keypair by default; Jumble-specific tests set this.
+    adapter._encryption_keypair = None
     return adapter
 
 
@@ -369,3 +371,32 @@ class TestNIP09Deletion:
         # The note must still route (impostor's deletion ignored).
         await router.route(note, "wss://test.relay")
         mock_adapter._handle_mention.assert_called_once_with(note)
+
+
+class TestJumbleReceive:
+    """Test that Jumble-format gift wraps (encrypted to the encryption pubkey)
+    are received and routed to _handle_dm."""
+
+    async def test_jumble_format_gift_wrap_received(self, mock_adapter, keypair):
+        """A Jumble-format gift wrap addressed to our encryption pubkey is
+        unwrapped (using the encryption privkey) and routed to _handle_dm."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor, generate_encryption_keypair,
+        )
+        # Give the mock adapter an encryption keypair.
+        recip_enc = generate_encryption_keypair()
+        mock_adapter._encryption_keypair = recip_enc
+        sender_enc = generate_encryption_keypair()
+
+        rumor = create_dm_rumor(
+            "hello from jumble", mock_adapter.pubkey, keypair["pubkey"]
+        )
+        gw = create_jumble_gift_wrap(
+            rumor, mock_adapter.pubkey, recip_enc["pubkey_hex"],
+            keypair["nsec"], sender_enc["privkey_hex"],
+        )
+        router = EventRouter(mock_adapter)
+        await router.route(gw, "wss://test.relay")
+        mock_adapter._handle_dm.assert_called_once()
+        args = mock_adapter._handle_dm.call_args
+        assert args[0][1] == "hello from jumble"

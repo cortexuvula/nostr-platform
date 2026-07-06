@@ -332,3 +332,156 @@ class TestGiftWrap:
         assert len(set(timestamps)) > 1, (
             "seal created_at never varied across 10 wraps — not randomized"
         )
+
+
+class TestEncryptionKey:
+    """Test Jumble kind-10044 encryption-keypair helpers."""
+
+    def test_generate_encryption_keypair_shape(self):
+        """generate_encryption_keypair returns privkey_hex, pubkey_hex, nsec."""
+        from plugins.platforms.nostr.crypto import generate_encryption_keypair
+        kp = generate_encryption_keypair()
+        assert len(kp["privkey_hex"]) == 64
+        assert len(kp["pubkey_hex"]) == 64
+        assert kp["nsec"].startswith("nsec1")
+        # pubkey must derive from privkey
+        from pynostr.key import PrivateKey
+        assert PrivateKey(bytes.fromhex(kp["privkey_hex"])).public_key.hex() == kp["pubkey_hex"]
+
+    def test_create_encryption_key_event_shape(self, keypair_a):
+        """create_encryption_key_event produces kind 10044 with empty content
+        and a single n-tag carrying the encryption pubkey."""
+        from plugins.platforms.nostr.crypto import (
+            create_encryption_key_event, generate_encryption_keypair, EventSigner,
+        )
+        enc_kp = generate_encryption_keypair()
+        signer = EventSigner(keypair_a["nsec"])
+        event = create_encryption_key_event(enc_kp["pubkey_hex"], signer)
+        assert event["kind"] == 10044
+        assert event["content"] == ""
+        assert event["pubkey"] == keypair_a["pubkey"]  # signed by identity
+        n_tags = [t for t in event["tags"] if t[0] == "n"]
+        assert len(n_tags) == 1
+        assert n_tags[0][1] == enc_kp["pubkey_hex"]
+        assert event["sig"]  # signed
+
+    def test_parse_encryption_pubkey_extracts_n_tag(self):
+        """parse_encryption_pubkey extracts the n-tag from a 10044 event."""
+        from plugins.platforms.nostr.crypto import parse_encryption_pubkey
+        event = {"kind": 10044, "tags": [["n", "abc123pubkey"]]}
+        assert parse_encryption_pubkey(event) == "abc123pubkey"
+
+    def test_parse_encryption_pubkey_returns_none_without_n_tag(self):
+        """parse_encryption_pubkey returns None if no n-tag."""
+        from plugins.platforms.nostr.crypto import parse_encryption_pubkey
+        assert parse_encryption_pubkey({"kind": 10044, "tags": []}) is None
+        assert parse_encryption_pubkey({"kind": 10044, "tags": [["x", "y"]]}) is None
+
+
+class TestJumbleGiftWrap:
+    """Test create_jumble_gift_wrap — Jumble's non-standard NIP-17 variant."""
+
+    def test_jumble_gift_wrap_has_dual_p_tags(self, keypair_a, keypair_b):
+        """Gift wrap must carry TWO p-tags: encryption pubkey + main pubkey."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor,
+            generate_encryption_keypair,
+        )
+        sender_enc = generate_encryption_keypair()
+        recip_enc = generate_encryption_keypair()
+        rumor = create_dm_rumor("hi", keypair_b["pubkey"], keypair_a["pubkey"])
+        gw = create_jumble_gift_wrap(
+            rumor, keypair_b["pubkey"], recip_enc["pubkey_hex"],
+            keypair_a["nsec"], sender_enc["privkey_hex"],
+        )
+        p_values = [t[1] for t in gw["tags"] if t[0] == "p"]
+        assert recip_enc["pubkey_hex"] in p_values
+        assert keypair_b["pubkey"] in p_values
+        assert len(p_values) == 2
+
+    def test_jumble_gift_wrap_seal_has_n_tag(self, keypair_a, keypair_b):
+        """The seal must carry an n-tag with the sender's encryption pubkey."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor, generate_encryption_keypair,
+            nip44_decrypt,
+        )
+        sender_enc = generate_encryption_keypair()
+        recip_enc = generate_encryption_keypair()
+        rumor = create_dm_rumor("hi", keypair_b["pubkey"], keypair_a["pubkey"])
+        gw = create_jumble_gift_wrap(
+            rumor, keypair_b["pubkey"], recip_enc["pubkey_hex"],
+            keypair_a["nsec"], sender_enc["privkey_hex"],
+        )
+        # Decrypt gift-wrap layer to get the seal, using recipient's ENC key.
+        seal_json = nip44_decrypt(
+            gw["content"], recip_enc["privkey_hex"], gw["pubkey"],
+        )
+        seal = json.loads(seal_json)
+        n_tags = [t for t in seal["tags"] if t[0] == "n"]
+        assert len(n_tags) == 1
+        assert n_tags[0][1] == sender_enc["pubkey_hex"]
+
+    def test_jumble_seal_encrypted_to_encryption_pubkey(self, keypair_a, keypair_b):
+        """The seal payload must decrypt with the recipient's ENC privkey, not main."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor, generate_encryption_keypair,
+            nip44_decrypt,
+        )
+        sender_enc = generate_encryption_keypair()
+        recip_enc = generate_encryption_keypair()
+        rumor = create_dm_rumor("secret", keypair_b["pubkey"], keypair_a["pubkey"])
+        gw = create_jumble_gift_wrap(
+            rumor, keypair_b["pubkey"], recip_enc["pubkey_hex"],
+            keypair_a["nsec"], sender_enc["privkey_hex"],
+        )
+        # Decrypt gift-wrap layer with recipient ENC key.
+        seal_json = nip44_decrypt(
+            gw["content"], recip_enc["privkey_hex"], gw["pubkey"],
+        )
+        seal = json.loads(seal_json)
+        # Decrypt seal content with recipient ENC key + sender ENC pubkey.
+        rumor_json = nip44_decrypt(
+            seal["content"], recip_enc["privkey_hex"], sender_enc["pubkey_hex"],
+        )
+        unwrapped = json.loads(rumor_json)
+        assert unwrapped["content"] == "secret"
+
+    def test_jumble_gift_wrap_roundtrip(self, keypair_a, keypair_b):
+        """Full create-as-Jumble-sender → unwrap-as-Jumble-recipient cycle."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor, generate_encryption_keypair,
+        )
+        sender_enc = generate_encryption_keypair()
+        recip_enc = generate_encryption_keypair()
+        rumor = create_dm_rumor("roundtrip", keypair_b["pubkey"], keypair_a["pubkey"])
+        gw = create_jumble_gift_wrap(
+            rumor, keypair_b["pubkey"], recip_enc["pubkey_hex"],
+            keypair_a["nsec"], sender_enc["privkey_hex"],
+        )
+        # Unwrap as recipient using the ENC privkey as an extra key.
+        result = unwrap_gift_wrap(
+            gw, keypair_b["nsec"],
+            extra_privkeys=[recip_enc["privkey_hex"]],
+        )
+        assert result is not None
+        unwrapped, seal_pubkey = result
+        assert unwrapped["content"] == "roundtrip"
+        assert seal_pubkey == keypair_a["pubkey"]  # identity-signed seal
+
+    def test_jumble_gift_wrap_backdated_and_expiration(self, keypair_a, keypair_b):
+        """Jumble gift wraps must also backdate + carry expiration."""
+        from plugins.platforms.nostr.crypto import (
+            create_jumble_gift_wrap, create_dm_rumor, generate_encryption_keypair,
+        )
+        sender_enc = generate_encryption_keypair()
+        recip_enc = generate_encryption_keypair()
+        rumor = create_dm_rumor("x", keypair_b["pubkey"], keypair_a["pubkey"])
+        gw = create_jumble_gift_wrap(
+            rumor, keypair_b["pubkey"], recip_enc["pubkey_hex"],
+            keypair_a["nsec"], sender_enc["privkey_hex"],
+        )
+        now = int(time.time())
+        assert now - 172800 <= gw["created_at"] <= now
+        exp_tags = [t for t in gw["tags"] if t[0] == "expiration"]
+        assert len(exp_tags) == 1
+        assert int(exp_tags[0][1]) > now

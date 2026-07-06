@@ -615,3 +615,90 @@ class TestHandleMentionAuthorization:
         assert kwargs.get("thread_id") == "note_xyz"
 
 
+class TestJumbleIntegration:
+    """Test Jumble kind-10044 compatibility — encryption keypair, recipient
+    detection, and the Jumble-format send branch."""
+
+    def _make_adapter(self, mock_env, monkeypatch, tmp_path=None):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://own.relay"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.query = AsyncMock(return_value=[])
+        adapter.relay_pool.publish = AsyncMock()
+        adapter.relay_pool.publish_to = AsyncMock()
+        adapter._resolve_recipient_relays = AsyncMock(return_value=[])
+        return adapter
+
+    def test_encryption_keypair_generated_on_init(self, mock_env, monkeypatch):
+        """A fresh adapter has an encryption keypair (generated if none on disk)."""
+        monkeypatch.setattr(
+            "plugins.platforms.nostr.adapter._ENC_KEY_FILE", None  # force generate
+        )
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        assert adapter._encryption_keypair is not None
+        assert "privkey_hex" in adapter._encryption_keypair
+        assert "pubkey_hex" in adapter._encryption_keypair
+
+    async def test_resolve_recipient_encryption_pubkey_finds_10044(
+        self, mock_env, monkeypatch
+    ):
+        """A recipient with a kind 10044 event → returns the n-tag pubkey."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        enc_pubkey = PrivateKey().public_key.hex()
+        peer = PrivateKey().public_key.hex()
+        adapter.relay_pool.query.return_value = [{
+            "kind": 10044, "tags": [["n", enc_pubkey]],
+        }]
+        result = await adapter._resolve_recipient_encryption_pubkey(peer)
+        assert result == enc_pubkey
+
+    async def test_resolve_encryption_returns_none_for_standard_user(
+        self, mock_env, monkeypatch
+    ):
+        """No kind 10044 → None (standard NIP-17 path)."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.query.return_value = []  # no 10044
+        peer = PrivateKey().public_key.hex()
+        result = await adapter._resolve_recipient_encryption_pubkey(peer)
+        assert result is None
+
+    async def test_send_to_jumble_user_uses_jumble_format(
+        self, mock_env, monkeypatch
+    ):
+        """Sending to a Jumble user (has 10044) produces a dual-p-tag gift wrap."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer_main = PrivateKey().public_key.hex()
+        peer_enc = PrivateKey().public_key.hex()
+        adapter._resolve_recipient_encryption_pubkey = AsyncMock(
+            return_value=peer_enc
+        )
+        await adapter.send(chat_id=peer_main, content="hello jumble")
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        recip_event, _ = adapter.relay_pool.publish_to.await_args.args[:2]
+        assert recip_event["kind"] == 1059
+        p_values = [t[1] for t in recip_event["tags"] if t[0] == "p"]
+        assert peer_enc in p_values, "must p-tag the encryption pubkey"
+        assert peer_main in p_values, "must p-tag the main pubkey"
+        assert len(p_values) == 2
+
+    async def test_send_to_standard_user_uses_single_p_tag(
+        self, mock_env, monkeypatch
+    ):
+        """Sending to a standard user (no 10044) produces a single-p-tag wrap."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        adapter._resolve_recipient_encryption_pubkey = AsyncMock(return_value=None)
+        await adapter.send(chat_id=peer, content="hello standard")
+        adapter.relay_pool.publish_to.assert_awaited_once()
+        recip_event, _ = adapter.relay_pool.publish_to.await_args.args[:2]
+        p_values = [t[1] for t in recip_event["tags"] if t[0] == "p"]
+        assert p_values == [peer], "standard user gets single main-pubkey p-tag"
+
+

@@ -453,7 +453,70 @@ def create_gift_wrap(rumor: dict, recipient_pubkey_hex: str,
     return gift_wrap
 
 
-def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
+def create_jumble_gift_wrap(rumor: dict, recipient_main_pubkey_hex: str,
+                             recipient_encryption_pubkey_hex: str,
+                             sender_nsec: str,
+                             sender_encryption_privkey_hex: str) -> dict:
+    """Create a gift wrap in Jumble's non-standard encryption-keypair format.
+
+    Differs from standard NIP-17 ``create_gift_wrap`` in three ways, all
+    matching Jumble's wire format (verified against jumble.social v26.7.1):
+
+    1. The seal's NIP-44 payload is encrypted to the recipient's
+       **encryption** pubkey (from their kind 10044), not the main pubkey.
+    2. The seal carries an ``n`` tag with the sender's encryption pubkey and
+       is signed by the sender's identity key.
+    3. The gift wrap carries **two** p-tags (encryption + main) and its
+       NIP-44 payload is encrypted to the encryption pubkey.
+    """
+    sender_signer = EventSigner(sender_nsec)
+    sender_enc_pubkey = PrivateKey(
+        bytes.fromhex(sender_encryption_privkey_hex)
+    ).public_key.hex()
+
+    # Step 1: encrypt the rumor to the recipient's ENCRYPTION pubkey using
+    # the sender's ENCRYPTION privkey (not the identity key).
+    encrypted_rumor = nip44_encrypt(
+        json.dumps(rumor),
+        sender_encryption_privkey_hex,
+        recipient_encryption_pubkey_hex,
+    )
+
+    # Step 2: seal signed by identity, carrying the sender's encryption pubkey.
+    seal = sender_signer.sign_event(
+        kind=13,
+        content=encrypted_rumor,
+        tags=[["n", sender_enc_pubkey]],
+        created_at=_random_past_timestamp(),
+    )
+
+    # Step 3-4: ephemeral key, encrypt seal to recipient's ENCRYPTION pubkey.
+    ephemeral_key = PrivateKey()
+    encrypted_seal = nip44_encrypt(
+        json.dumps(seal),
+        ephemeral_key.hex(),
+        recipient_encryption_pubkey_hex,
+    )
+
+    # Step 5: gift wrap with dual p-tags (encryption + main), backdated,
+    # with expiration — encrypted to the encryption pubkey.
+    gw_tags = [
+        ["p", recipient_encryption_pubkey_hex],
+        ["p", recipient_main_pubkey_hex],
+        ["expiration", str(int(time.time()) + GIFT_WRAP_EXPIRATION_SECONDS)],
+    ]
+    ephemeral_signer = EventSigner(ephemeral_key.bech32())
+    gift_wrap = ephemeral_signer.sign_event(
+        kind=1059,
+        content=encrypted_seal,
+        tags=gw_tags,
+        created_at=_random_past_timestamp(),
+    )
+    return gift_wrap
+
+
+def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str,
+                     extra_privkeys: Optional[list] = None) -> Optional[tuple]:
     """Unwrap a NIP-17 gift-wrapped event (kind 1059).
 
     Steps:
@@ -461,13 +524,17 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     2. NIP-44 decrypt content → seal JSON (using ephemeral pubkey)
     3. Parse seal (kind 13)
     4. Verify seal signature
-    5. NIP-44 decrypt seal content → rumor JSON (using seal pubkey)
+    5. NIP-44 decrypt seal content → rumor JSON
     6. Parse rumor
     7. Return (rumor, seal_pubkey)
 
     Args:
         gift_event: The kind 1059 gift-wrap event
         recipient_nsec: Our nsec (bech32)
+        extra_privkeys: Additional recipient privkeys to try for the outer
+            decrypt — used for Jumble's encryption-keypair scheme where the
+            gift wrap is encrypted to a separate encryption pubkey, not the
+            main identity key. The main key is tried first.
 
     Returns:
         Tuple of (rumor_dict, seal_pubkey_hex) or None if decryption fails
@@ -479,24 +546,39 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     recipient_privkey_hex = recipient_privkey.hex()
     recipient_pubkey = recipient_privkey.public_key.hex()
 
-    # Check p tag matches our pubkey
-    p_tags = [t for t in gift_event.get("tags", []) if isinstance(t, list) and len(t) >= 2 and t[0] == "p"]
-    if not any(t[1] == recipient_pubkey for t in p_tags):
+    # Check p tag matches our pubkey (main or any extra-derived pubkey).
+    candidate_privkeys = [recipient_privkey_hex]
+    if extra_privkeys:
+        candidate_privkeys.extend(extra_privkeys)
+    candidate_pubkeys = {
+        PrivateKey(bytes.fromhex(pk)).public_key.hex()
+        for pk in candidate_privkeys
+    }
+    p_tags = [t for t in gift_event.get("tags", [])
+              if isinstance(t, list) and len(t) >= 2 and t[0] == "p"]
+    if not any(t[1] in candidate_pubkeys for t in p_tags):
         return None
 
     sender_pubkey = gift_event.get("pubkey", "")
     if not sender_pubkey:
         return None
 
-    # Step 2: NIP-44 decrypt the seal
-    try:
-        seal_json = nip44_decrypt(
-            gift_event["content"],
-            recipient_privkey_hex,
-            sender_pubkey,
-        )
-    except Exception as e:
-        logger.debug(f"Gift-wrap seal decryption failed: {e}")
+    # Step 2: NIP-44 decrypt the seal. Try each candidate privkey (main first,
+    # then extras for the Jumble encryption-keypair case). Remember which one
+    # worked — the inner layer uses the same recipient key.
+    seal_json = None
+    working_privkey_hex = None
+    for pk_hex in candidate_privkeys:
+        try:
+            seal_json = nip44_decrypt(
+                gift_event["content"], pk_hex, sender_pubkey,
+            )
+            working_privkey_hex = pk_hex
+            break
+        except Exception:
+            continue
+    if seal_json is None:
+        logger.debug("Gift-wrap seal decryption failed for all candidate keys")
         return None
 
     # Step 3: Parse the seal
@@ -521,12 +603,16 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
     except Exception:
         return None
 
-    # Step 5: NIP-44 decrypt the rumor from seal content
+    # Step 5: NIP-44 decrypt the rumor from seal content. The seal's pubkey
+    # for the NIP-44 conversation key is: the n-tag value (Jumble encryption
+    # pubkey) if present, else seal_pubkey (standard NIP-17 identity).
+    n_tag = next((t[1] for t in seal.get("tags", [])
+                  if isinstance(t, list) and len(t) >= 2 and t[0] == "n"), None)
+    seal_conv_pubkey = n_tag if n_tag else seal_pubkey
+
     try:
         rumor_json = nip44_decrypt(
-            seal["content"],
-            recipient_privkey_hex,
-            seal_pubkey,
+            seal["content"], working_privkey_hex, seal_conv_pubkey,
         )
     except Exception as e:
         logger.debug(f"Rumor decryption failed: {e}")
@@ -539,6 +625,61 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str) -> Optional[tuple]:
         return None
 
     return (rumor, seal_pubkey)
+
+
+# ---------------------------------------------------------------------------
+# Jumble kind-10044 encryption-keypair scheme
+# ---------------------------------------------------------------------------
+
+# Jumble (jumble.social) uses a non-standard "encryption keypair" layer on top
+# of NIP-17/59: each user publishes a kind 10044 event advertising a separate
+# encryption pubkey in an `n` tag. Gift-wrap seals and payloads are then
+# encrypted to that encryption pubkey (not the main identity pubkey), seals
+# carry an `n` tag with the sender's encryption pubkey, and gift wraps carry
+# two p-tags (encryption + main). Without this, Jumble fetches our standard
+# gift wraps but silently fails to decrypt them.
+ENCRYPTION_KEY_KIND = 10044
+
+
+def generate_encryption_keypair() -> dict:
+    """Generate a fresh encryption keypair for the Jumble 10044 scheme.
+
+    Returns ``{"privkey_hex", "pubkey_hex", "nsec"}``. This key is persistent
+    (stored by the adapter in ~/.hermes/) so Jumble users who learn it from
+    our kind 10044 can keep decrypting across restarts.
+    """
+    sk = PrivateKey()
+    return {
+        "privkey_hex": sk.hex(),
+        "pubkey_hex": sk.public_key.hex(),
+        "nsec": sk.bech32(),
+    }
+
+
+def create_encryption_key_event(encryption_pubkey_hex: str,
+                                 signer: EventSigner) -> dict:
+    """Sign a kind 10044 event advertising our encryption pubkey.
+
+    Per Jumble's scheme: ``content`` is empty, a single ``n`` tag carries the
+    encryption pubkey, and the event is signed by the identity key.
+    """
+    return signer.sign_event(
+        kind=ENCRYPTION_KEY_KIND,
+        content="",
+        tags=[["n", encryption_pubkey_hex]],
+    )
+
+
+def parse_encryption_pubkey(kind10044_event: dict) -> Optional[str]:
+    """Extract the encryption pubkey from a kind 10044 event's ``n`` tag.
+
+    Returns the hex pubkey, or None if the event has no valid ``n`` tag.
+    """
+    for tag in kind10044_event.get("tags", []):
+        if (isinstance(tag, list) and len(tag) >= 2
+                and tag[0] == "n" and tag[1]):
+            return tag[1]
+    return None
 
 
 def create_dm_rumor(content: str, recipient_pubkey_hex: str,

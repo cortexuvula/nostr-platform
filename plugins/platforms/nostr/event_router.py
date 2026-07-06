@@ -109,7 +109,15 @@ class EventRouter:
 
     async def _handle_gift_wrap(self, event: dict, relay_url: str):
         """NIP-17: unwrap a kind 1059 gift-wrapped event."""
-        result = unwrap_gift_wrap(event, self.adapter.nsec)
+        # Pass our encryption privkey (Jumble 10044 scheme) as an extra
+        # decrypt candidate so Jumble-format gift wraps (encrypted to the
+        # encryption pubkey) can be unwrapped.
+        extra_privkeys = None
+        enc_kp = getattr(self.adapter, "_encryption_keypair", None)
+        if enc_kp:
+            extra_privkeys = [enc_kp["privkey_hex"]]
+        result = unwrap_gift_wrap(event, self.adapter.nsec,
+                                   extra_privkeys=extra_privkeys)
         if result is None:
             logger.debug("Failed to unwrap gift-wrap — not for us or decrypt error")
             return
