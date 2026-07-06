@@ -318,3 +318,167 @@ class TestConnectLifecycle:
             assert not t.done(), "current tasks should still be running"
         await pool.disconnect()
 
+
+class TestNIP42Auth:
+    """Test NIP-42 client authentication to relays that gate DMs behind AUTH."""
+
+    async def test_handle_message_stores_challenge(self):
+        """An incoming AUTH message stores the challenge on the connection."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+
+        await pool._handle_message(conn, ["AUTH", "challenge123"])
+        assert conn.challenge == "challenge123"
+
+    async def test_authenticate_without_signer_returns_false(self):
+        """Without a signer set, _authenticate returns False and sends nothing."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        conn.challenge = "abc"
+        conn.send_raw = AsyncMock()
+
+        result = await pool._authenticate(conn)
+        assert result is False
+        conn.send_raw.assert_not_called()
+
+    async def test_authenticate_signs_kind_22242(self):
+        """_authenticate signs a kind 22242 event with relay+challenge tags,
+        sends it as an AUTH message, and sets authenticated=True on OK."""
+        from unittest.mock import AsyncMock
+        from plugins.platforms.nostr.crypto import EventSigner
+        import json as _json
+
+        from pynostr.key import PrivateKey as _PK
+        signer = EventSigner(_PK().bech32())
+
+        pool = RelayPool([])
+        pool.set_signer(signer)
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        conn.challenge = "test-challenge-xyz"
+        pool.connections[conn.url] = conn
+
+        sent_messages = []
+        async def capture_send(msg):
+            sent_messages.append(msg)
+        conn.send_raw = capture_send
+
+        # Drive _authenticate and feed it an OK for the 22242 event.
+        async def feed_ok():
+            await asyncio.sleep(0)  # let _authenticate register its future
+            # Parse the sent AUTH message to get the event id.
+            assert sent_messages, "no AUTH message sent"
+            auth_msg = _json.loads(sent_messages[0])
+            assert auth_msg[0] == "AUTH", f"expected AUTH type, got {auth_msg[0]}"
+            ev = auth_msg[1]
+            assert ev["kind"] == 22242
+            # Verify tags.
+            tags = {t[0]: t[1] for t in ev["tags"]}
+            assert tags["relay"] == "wss://auth.relay"
+            assert tags["challenge"] == "test-challenge-xyz"
+            assert ev["sig"], "event must be signed"
+            # Feed the OK.
+            await pool._handle_message(conn, ["OK", ev["id"], True, ""])
+
+        feed_task = asyncio.create_task(feed_ok())
+        result = await pool._authenticate(conn, timeout=2.0)
+        await feed_task
+
+        assert result is True
+        assert conn.authenticated is True
+
+    async def test_authenticate_failure_keeps_authenticated_false(self):
+        """An auth-failure OK (accepted=false) leaves authenticated False."""
+        from unittest.mock import AsyncMock
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey as _PK
+        import json as _json
+
+        signer = EventSigner(_PK().bech32())
+        pool = RelayPool([])
+        pool.set_signer(signer)
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        conn.challenge = "c"
+        pool.connections[conn.url] = conn
+        sent = []
+        conn.send_raw = lambda m: sent.append(m) or asyncio.sleep(0)
+
+        async def feed_fail():
+            await asyncio.sleep(0)
+            ev = _json.loads(sent[0])[1]
+            await pool._handle_message(
+                conn, ["OK", ev["id"], False, "auth-failure: bad sig"]
+            )
+        feed_task = asyncio.create_task(feed_fail())
+        result = await pool._authenticate(conn, timeout=2.0)
+        await feed_task
+        assert result is False
+        assert conn.authenticated is False
+
+    async def test_closed_restricted_does_not_retry(self):
+        """A CLOSED with 'restricted:' must NOT trigger resubscribe (forbidden)."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://restricted.relay")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+        # Register a subscription so the CLOSED has something to match.
+        pool._subscriptions.append(({"kinds": [1059]}, "sub_1"))
+        pool._resubscribe_after = AsyncMock()
+
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "restricted: no DMs allowed"])
+        pool._resubscribe_after.assert_not_called()
+
+    async def test_closed_auth_required_triggers_auth(self):
+        """A CLOSED with 'auth-required:' triggers _authenticate on the conn."""
+        from unittest.mock import AsyncMock
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey as _PK
+
+        pool = RelayPool([])
+        pool._running = True
+        pool.set_signer(EventSigner(_PK().bech32()))
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        conn.challenge = "pre-stored-challenge"
+        pool.connections[conn.url] = conn
+        pool._subscriptions.append(({"kinds": [1059]}, "sub_1"))
+        pool._authenticate = AsyncMock(return_value=True)
+        pool._resubscribe_after = AsyncMock()
+
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "auth-required: please auth"])
+        # _handle_message schedules _auth_then_resubscribe via create_task;
+        # yield to let it run before asserting.
+        await asyncio.sleep(0)
+        pool._authenticate.assert_awaited_once_with(conn)
+
+    async def test_ok_auth_required_for_publish_triggers_auth(self):
+        """A publish OK with accepted=false 'auth-required:' triggers auth so
+        the next publish attempt can succeed on the auth-gated relay."""
+        from unittest.mock import AsyncMock
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey as _PK
+
+        pool = RelayPool([])
+        pool._running = True
+        pool.set_signer(EventSigner(_PK().bech32()))
+        conn = RelayConnection("wss://auth.relay")
+        conn.connected = True
+        conn.challenge = "c"
+        pool.connections[conn.url] = conn
+        pool._authenticate = AsyncMock(return_value=True)
+
+        # Simulate a publish OK rejection demanding auth.
+        await pool._handle_message(
+            conn, ["OK", "published-event-1", False, "auth-required: please auth"]
+        )
+        await asyncio.sleep(0)  # let the scheduled auth task run
+        pool._authenticate.assert_awaited_once_with(conn)
+
+

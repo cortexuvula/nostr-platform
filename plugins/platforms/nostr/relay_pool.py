@@ -34,6 +34,10 @@ class RelayConnection:
         self._reconnect_attempts = 0
         self._listen_task: Optional[asyncio.Task] = None
         self._stop = False
+        # NIP-42: per-connection auth state. The challenge is set by an
+        # incoming AUTH message and is valid for the connection's lifetime.
+        self.challenge: Optional[str] = None
+        self.authenticated: bool = False
 
     async def connect(self) -> bool:
         """Open WebSocket connection to this relay."""
@@ -115,8 +119,24 @@ class RelayPool:
         # query() REQ are routed here instead of the global event stream.
         self._active_queries: dict[str, asyncio.Queue] = {}
 
+        # NIP-42 auth: the signer (EventSigner) is injected by the adapter so
+        # the pool can sign kind-22242 auth events. When None, auth-required
+        # signals are logged and the operation fails gracefully.
+        self._signer = None
+        # _pending_auth_ok[auth_event_id] = asyncio.Future — resolved by the OK
+        # handler when the relay acks our kind-22242 auth event.
+        self._pending_auth_ok: dict[str, asyncio.Future] = {}
+
         # Dedup config
         self._max_dedup = MAX_DEDUP_SIZE
+
+    def set_signer(self, signer) -> None:
+        """Inject the EventSigner used for NIP-42 authentication.
+
+        Called by the adapter after construction. Without a signer, the pool
+        cannot authenticate to auth-gated relays (graceful degradation).
+        """
+        self._signer = signer
 
     def _next_sub_id(self) -> str:
         """Return a process-unique subscription id."""
@@ -287,13 +307,36 @@ class RelayPool:
                 ok_event_id = message[1]
                 accepted = bool(message[2])
                 ok_msg = message[3] if len(message) > 3 else ""
+                # NIP-42: if this OK acks a kind-22242 auth event, resolve the
+                # pending _authenticate future and mark the connection authed.
+                auth_fut = self._pending_auth_ok.pop(ok_event_id, None)
+                if auth_fut and not auth_fut.done():
+                    auth_fut.set_result({"accepted": accepted, "message": ok_msg})
+                    if accepted:
+                        conn.authenticated = True
                 # Resolve the matching relay's future in every pending group
                 # for this event_id (concurrent publishes of the same event).
                 for group in self._pending_ok.get(ok_event_id, []):
                     fut = group.get(conn.url)
                     if fut and not fut.done():
                         fut.set_result({"accepted": accepted, "message": ok_msg})
+                # NIP-42: a rejected publish demanding auth triggers on-demand
+                # authentication so the next attempt succeeds. Only for real
+                # publish events (not our own auth-event OK, handled above).
+                if (not accepted and ok_msg.startswith("auth-required:")
+                        and not auth_fut and self._signer
+                        and conn.challenge and not conn.authenticated):
+                    asyncio.create_task(self._authenticate(conn))
             logger.debug(f"Relay {conn.url} OK: {message}")
+
+        elif msg_type == "AUTH":
+            # NIP-42: ["AUTH", "<challenge>"]. The challenge is valid for the
+            # connection's lifetime. We store it and authenticate on-demand
+            # when an auth-required signal arrives (see CLOSED / OK branches).
+            challenge = message[1] if len(message) > 1 else ""
+            if challenge:
+                conn.challenge = challenge
+                logger.debug(f"Relay {conn.url} sent AUTH challenge")
 
         elif msg_type == "EOSE":
             # [EOSE, subscription_id]
@@ -313,7 +356,22 @@ class RelayPool:
             msg = message[2] if len(message) > 2 else ""
             logger.info(f"Relay {conn.url} CLOSED sub {sub_id}: {msg}")
 
-            # If the relay closed a subscription (e.g. "auth-required"),
+            # NIP-42: "restricted:" means the action is forbidden for this
+            # account — retrying is futile, so don't resubscribe.
+            if msg.startswith("restricted:"):
+                return
+
+            # NIP-42: "auth-required:" means we must authenticate before the
+            # relay will serve this subscription. Do so on-demand, then
+            # resubscribe. Without a signer or without a stored challenge,
+            # auth is impossible — fall through to plain resubscribe (which
+            # will likely get CLOSED again, but avoids a hard failure).
+            if (msg.startswith("auth-required:") and self._signer
+                    and conn.challenge and not conn.authenticated):
+                asyncio.create_task(self._auth_then_resubscribe(conn, sub_id, msg))
+                return
+
+            # If the relay closed a subscription (e.g. transient error),
             # resubscribe after a short delay so we don't permanently lose
             # events from this relay. Only resubscribe if the pool is still
             # running and the subscription is still active.
@@ -348,6 +406,72 @@ class RelayPool:
         """Send a single REQ to a relay using the given sub_id."""
         req = json.dumps(["REQ", sub_id, filter_dict])
         await conn.send_raw(req)
+
+    async def _authenticate(self, conn: RelayConnection,
+                             timeout: float = 5.0) -> bool:
+        """NIP-42: authenticate to *conn* by signing and sending a kind-22242
+        event in response to its stored challenge.
+
+        Returns True on a successful auth (relay OK accepted=True), False on
+        failure, timeout, missing signer, or missing challenge. On success,
+        ``conn.authenticated`` is set so subsequent operations skip re-auth.
+        """
+        if not self._signer or not conn.challenge:
+            return False
+
+        # Sign the kind-22242 auth event per NIP-42: tags MUST be relay+challenge.
+        auth_event = self._signer.sign_event(
+            kind=22242,
+            content="",
+            tags=[
+                ["relay", conn.url],
+                ["challenge", conn.challenge],
+            ],
+        )
+        event_id = auth_event.get("id", "")
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_auth_ok[event_id] = fut
+
+        try:
+            # NIP-42: send as an AUTH message (NOT EVENT).
+            await conn.send_raw(json.dumps(["AUTH", auth_event]))
+            result = await asyncio.wait_for(fut, timeout=timeout)
+            return bool(result.get("accepted"))
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"NIP-42 auth to {conn.url} failed: {e}")
+            return False
+        finally:
+            self._pending_auth_ok.pop(event_id, None)
+
+    async def _auth_then_resubscribe(self, conn: RelayConnection,
+                                      sub_id: str, reason: str):
+        """Authenticate to *conn*, then re-issue the CLOSED subscription.
+
+        NIP-42 flow for auth-required subscriptions: authenticate, then
+        re-send the REQ (the original subscription was terminated by CLOSED).
+        """
+        if not self._running or not conn.connected:
+            return
+        success = await self._authenticate(conn)
+        if not success:
+            logger.warning(
+                f"NIP-42 auth to {conn.url} failed ({reason}); "
+                f"subscription {sub_id} will not be retried on this relay"
+            )
+            return
+        # Find the filter for this subscription and re-send the REQ.
+        for f, sid in self._subscriptions:
+            if sid == sub_id:
+                try:
+                    await self._send_subscription(conn, f, sub_id=sub_id)
+                    logger.info(
+                        f"Resubscribed to {conn.url} for {sub_id} after NIP-42 auth"
+                    )
+                except Exception as e:
+                    logger.warning(f"Post-auth resubscribe to {conn.url} failed: {e}")
+                break
 
     async def _resubscribe_after(self, conn: RelayConnection,
                                  filter_dict: dict, sub_id: str,

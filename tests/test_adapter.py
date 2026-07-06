@@ -133,6 +133,16 @@ class TestConfigParsing:
             assert adapter.reply_publicly is True
             assert adapter.require_nip05 is True
 
+    def test_adapter_injects_signer_into_pool(self, mock_env, monkeypatch):
+        """The adapter's EventSigner must be injected into the relay pool so
+        NIP-42 AUTH challenges can be answered (kind-22242 signing)."""
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://relay.example.com"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        assert adapter.relay_pool._signer is adapter._signer
+
 
 class TestRequirementCheck:
     """Test check_requirements function."""

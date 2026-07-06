@@ -201,6 +201,10 @@ class NostrAdapter(BasePlatformAdapter):
 
         # --- Components ---
         self.relay_pool = RelayPool(self.relay_urls)
+        # NIP-42: inject the signer so the pool can answer AUTH challenges
+        # from relays that gate DMs behind authentication.
+        if self._signer:
+            self.relay_pool.set_signer(self._signer)
         self.router = EventRouter(self)
         self.profiles = ProfileCache(self.relay_pool)
 
