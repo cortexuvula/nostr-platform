@@ -602,6 +602,10 @@ class RelayPool:
         pool. Opens a WebSocket, sends EVENT, reads frames until an OK for
         our event_id arrives or the timeout elapses, then closes. Returns
         ``{"accepted": bool, "message": str}``.
+
+        Handles NIP-42 AUTH challenges: if the relay sends an AUTH message
+        and the pool has a signer, signs a kind-22242 response so the relay
+        accepts the publish.
         """
         event_id = event.get("id", "")
         publish_msg = json.dumps(["EVENT", event])
@@ -622,8 +626,20 @@ class RelayPool:
                     msg = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if (isinstance(msg, list) and len(msg) >= 3
-                        and msg[0] == "OK" and msg[1] == event_id):
+                if not isinstance(msg, list) or not msg:
+                    continue
+                # NIP-42: respond to AUTH challenges so auth-gated external
+                # relays accept the publish. Reuse the pool's signer if set.
+                if msg[0] == "AUTH" and len(msg) >= 2 and self._signer:
+                    challenge = msg[1]
+                    auth_event = self._signer.sign_event(
+                        kind=22242, content="",
+                        tags=[["relay", url], ["challenge", challenge]],
+                    )
+                    await conn.send_raw(json.dumps(["AUTH", auth_event]))
+                    continue
+                if (len(msg) >= 3 and msg[0] == "OK"
+                        and msg[1] == event_id):
                     return {"accepted": bool(msg[2]),
                             "message": msg[3] if len(msg) > 3 else ""}
             return {"accepted": False, "message": "timeout"}

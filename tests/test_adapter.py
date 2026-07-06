@@ -374,7 +374,8 @@ class TestStandaloneSendSignature:
         self_event = fake_pool.publish.await_args.args[0]
         assert self_event["kind"] == 1059
         self_p_tags = [t for t in self_event["tags"] if t[0] == "p"]
-        assert self_p_tags[0][1] == sk.public_key.hex()
+        # Self-copy must address our main pubkey (standard: single; Jumble: dual).
+        assert sk.public_key.hex() in [t[1] for t in self_p_tags]
 
 
 class TestRecipientRelayDiscovery:
@@ -490,7 +491,9 @@ class TestSelfCopyGiftWrap:
         self_event = adapter.relay_pool.publish.await_args.args[0]
         assert self_event["kind"] == 1059
         p_tags = [t for t in self_event["tags"] if t[0] == "p"]
-        assert p_tags[0][1] == adapter.pubkey  # addressed to us (self-copy)
+        # Self-copy must address our main pubkey (standard: single tag;
+        # Jumble: dual tag including encryption pubkey).
+        assert adapter.pubkey in [t[1] for t in p_tags]
 
     async def test_send_unknown_recipient_uses_own_relays(self, mock_env, monkeypatch):
         """When recipient has no known relays, publish_to gets own relays."""
@@ -667,6 +670,28 @@ class TestJumbleIntegration:
         result = await adapter._resolve_recipient_encryption_pubkey(peer)
         assert result is None
 
+    async def test_resolve_encryption_does_not_cache_empty_result(
+        self, mock_env, monkeypatch
+    ):
+        """A failed/empty encryption-pubkey lookup must NOT be cached, so a
+        transient relay failure doesn't cause 10 minutes of wrong-format DMs."""
+        from pynostr.key import PrivateKey
+        from plugins.platforms.nostr.crypto import generate_encryption_keypair
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        enc_kp = generate_encryption_keypair()
+        # First call: empty (transient failure). Second call: real 10044 event.
+        adapter.relay_pool.query = AsyncMock(side_effect=[
+            [],  # first call: nothing found
+            [{"kind": 10044, "tags": [["n", enc_kp["pubkey_hex"]]]}],  # second: found
+        ])
+        first = await adapter._resolve_recipient_encryption_pubkey(peer)
+        assert first is None
+        second = await adapter._resolve_recipient_encryption_pubkey(peer)
+        assert second == enc_kp["pubkey_hex"], (
+            "empty result should not be cached — second call must re-query"
+        )
+
     async def test_send_to_jumble_user_uses_jumble_format(
         self, mock_env, monkeypatch
     ):
@@ -700,6 +725,34 @@ class TestJumbleIntegration:
         recip_event, _ = adapter.relay_pool.publish_to.await_args.args[:2]
         p_values = [t[1] for t in recip_event["tags"] if t[0] == "p"]
         assert p_values == [peer], "standard user gets single main-pubkey p-tag"
+
+    async def test_self_copy_uses_jumble_format_when_agent_has_enc_key(
+        self, mock_env, monkeypatch
+    ):
+        """When the agent has an encryption keypair, the self-copy gift wrap
+        must be Jumble-format (dual p-tags including the agent's encryption
+        pubkey) so it decrypts in the agent's own Jumble sent-history view."""
+        from pynostr.key import PrivateKey
+        from plugins.platforms.nostr.crypto import generate_encryption_keypair
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        # Give the agent a Jumble encryption keypair.
+        adapter._encryption_keypair = generate_encryption_keypair()
+        peer_main = PrivateKey().public_key.hex()
+        peer_enc = PrivateKey().public_key.hex()
+        adapter._resolve_recipient_encryption_pubkey = AsyncMock(
+            return_value=peer_enc
+        )
+        await adapter.send(chat_id=peer_main, content="hello")
+        # Self-copy goes through publish() (not publish_to).
+        adapter.relay_pool.publish.assert_awaited_once()
+        self_event = adapter.relay_pool.publish.await_args.args[0]
+        assert self_event["kind"] == 1059
+        p_values = [t[1] for t in self_event["tags"] if t[0] == "p"]
+        # Must include BOTH the agent's main pubkey AND encryption pubkey.
+        assert adapter.pubkey in p_values, "self-copy must p-tag agent main pubkey"
+        assert adapter._encryption_keypair["pubkey_hex"] in p_values, (
+            "self-copy must p-tag agent encryption pubkey for Jumble decrypt"
+        )
 
 
 class TestEnvAndConfigHelpers:

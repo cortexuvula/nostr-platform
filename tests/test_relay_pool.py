@@ -746,6 +746,45 @@ class TestListenRelayAndPublishOnce:
         assert result["accepted"] is False
         assert "connect" in result["message"]
 
+    async def test_publish_once_handles_auth_challenge(self, monkeypatch):
+        """_publish_once answers a NIP-42 AUTH challenge (when a signer is set)
+        before the relay accepts the EVENT."""
+        import json as _json
+        from unittest.mock import AsyncMock
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey as _PK
+        pool = RelayPool([])
+        pool.set_signer(EventSigner(_PK().bech32()))
+        event = {"id": "target_auth", "kind": 1, "content": "x"}
+
+        frames = [_json.dumps(["AUTH", "challenge-abc"])]
+        class FakeWS:
+            def __init__(self):
+                self._sent = []
+            async def recv(self):
+                if frames:
+                    return frames.pop(0)
+                # After auth, the relay sends OK.
+                return _json.dumps(["OK", "target_auth", True, ""])
+            async def send(self, msg):
+                self._sent.append(msg)
+            async def close(self):
+                pass
+        fake_ws = FakeWS()
+        async def fake_connect(self):
+            self.ws = fake_ws
+            self.connected = True
+            return True
+        monkeypatch.setattr(RelayConnection, "connect", fake_connect)
+        monkeypatch.setattr(RelayConnection, "disconnect", AsyncMock())
+
+        result = await pool._publish_once("wss://auth.example.com",
+                                           event, timeout=2.0)
+        assert result["accepted"] is True
+        # Verify an AUTH response was sent (the kind-22242 event).
+        auth_msgs = [m for m in fake_ws._sent if _json.loads(m)[0] == "AUTH"]
+        assert len(auth_msgs) == 1, "must respond to AUTH challenge"
+
     async def test_resubscribe_after_success(self, monkeypatch):
         """_resubscribe_after retries and succeeds."""
         from unittest.mock import AsyncMock

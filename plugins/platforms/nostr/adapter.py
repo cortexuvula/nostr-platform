@@ -358,7 +358,11 @@ class NostrAdapter(BasePlatformAdapter):
                 logger.debug(f"kind 10002 query failed for {pubkey[:12]}...: {e}")
 
         relays = list(dict.fromkeys(relays))  # dedup, preserve order
-        self._recipient_relay_cache[pubkey] = (relays, time.time())
+        # Only cache positive results — a transient relay failure shouldn't
+        # lock in an empty list for the TTL, or DMs would go to our own relays
+        # instead of the recipient's inbox until the cache expires.
+        if relays:
+            self._recipient_relay_cache[pubkey] = (relays, time.time())
         return relays
 
     async def _resolve_recipient_encryption_pubkey(
@@ -385,7 +389,11 @@ class NostrAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug(f"kind 10044 query failed for {main_pubkey[:12]}...: {e}")
 
-        self._recipient_enc_cache[main_pubkey] = (enc_pubkey, time.time())
+        # Only cache positive results — a transient relay failure or a user
+        # who hasn't published 10044 yet shouldn't lock in None for the TTL,
+        # or Jumble users would get standard-format DMs until the cache expires.
+        if enc_pubkey:
+            self._recipient_enc_cache[main_pubkey] = (enc_pubkey, time.time())
         return enc_pubkey
 
     async def _publish_encryption_key(self):
@@ -701,8 +709,18 @@ class NostrAdapter(BasePlatformAdapter):
 
                 # Self-copy: gift-wrap the same rumor to OUR pubkey, publish to
                 # our own relays so the message shows up in our sent history
-                # across clients (Amethyst/Nostur/Jumble all rely on this).
-                self_event = create_gift_wrap(rumor, self.pubkey, self.nsec)
+                # across clients. If we have a Jumble encryption keypair, use
+                # the Jumble format so our own sent-history decrypts in Jumble;
+                # otherwise standard NIP-17 (Amethyst/Nostur).
+                if self._encryption_keypair:
+                    self_event = create_jumble_gift_wrap(
+                        rumor, self.pubkey,
+                        self._encryption_keypair["pubkey_hex"],
+                        self.nsec,
+                        self._encryption_keypair["privkey_hex"],
+                    )
+                else:
+                    self_event = create_gift_wrap(rumor, self.pubkey, self.nsec)
                 await self.relay_pool.publish(self_event)
                 dm_event = recipient_event
             return SendResult(
@@ -899,8 +917,16 @@ async def _standalone_send_async(
         target_urls = recipient_relays or relay_urls
 
         # Self-copy: identical rumor, wrapped to ourselves, published to our own
-        # relays so sent messages appear in our DM history across clients.
-        self_event = create_gift_wrap(rumor, our_pubkey, nsec)
+        # relays so sent messages appear in our DM history. Use Jumble format
+        # if we have a persisted encryption keypair (so our own Jumble view can
+        # decrypt it), else standard NIP-17.
+        if enc_kp:
+            self_event = create_jumble_gift_wrap(
+                rumor, our_pubkey, enc_kp["pubkey_hex"], nsec,
+                enc_kp["privkey_hex"],
+            )
+        else:
+            self_event = create_gift_wrap(rumor, our_pubkey, nsec)
 
         try:
             results = await pool.publish_to(gift_event, target_urls, timeout=5.0)
