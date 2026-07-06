@@ -50,10 +50,25 @@ class EventRouter:
 
     def __init__(self, adapter: "NostrAdapter"):
         self.adapter = adapter
+        # NIP-09: event IDs that have been tombstoned by a kind 5 deletion
+        # request. Maps deleted_event_id → the pubkey of the author who
+        # requested deletion. At route time we verify the tombstoned event's
+        # author matches (NIP-09: only the original author can delete).
+        self._deleted_ids: dict[str, str] = {}
 
     async def route(self, event: dict, relay_url: str):
         """Route an event by its kind."""
         kind = event.get("kind")
+        event_id = event.get("id", "")
+
+        # NIP-09: skip events that have been tombstoned by a kind 5 deletion
+        # from the same author. Verify the deleter is the event's author so a
+        # malicious kind-5 can't suppress another user's content.
+        if event_id in self._deleted_ids:
+            deleter = self._deleted_ids[event_id]
+            if deleter == event.get("pubkey"):
+                logger.debug(f"Dropping tombstoned event {event_id[:16]}...")
+                return
 
         if kind == 1059:  # NIP-17 gift-wrapped DM
             await self._handle_gift_wrap(event, relay_url)
@@ -71,11 +86,26 @@ class EventRouter:
                 logger.debug(f"Dropping kind 4 with invalid signature: {event.get('id', '?')[:16]}")
                 return
             await self._handle_legacy_dm(event, relay_url)
+        elif kind == 5:   # NIP-09 deletion request
+            await self._handle_deletion(event, relay_url)
         elif kind == 0:   # metadata — update profile cache
             await self._handle_metadata(event, relay_url)
         elif kind == 7:   # reaction — ignore for now
             pass
         # Unknown kinds: silently ignore
+
+    async def _handle_deletion(self, event: dict, relay_url: str):
+        """NIP-09: record e-tagged event IDs as tombstoned.
+
+        Only events by the same pubkey as the deletion request are eligible
+        (the spec puts this constraint on relays; we enforce it client-side
+        too, at tombstone-apply time, since we don't store referenced events).
+        """
+        deleter_pubkey = event.get("pubkey", "")
+        for tag in event.get("tags", []):
+            if (isinstance(tag, list) and len(tag) >= 2
+                    and tag[0] == "e" and tag[1]):
+                self._deleted_ids[tag[1]] = deleter_pubkey
 
     async def _handle_gift_wrap(self, event: dict, relay_url: str):
         """NIP-17: unwrap a kind 1059 gift-wrapped event."""

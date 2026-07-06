@@ -316,3 +316,56 @@ class TestRumorPubkeyAuthentication:
         await router.route(gift_event, "wss://test.relay")
         # MUST NOT be accepted — rumor.pubkey (keypair) != seal.pubkey (impostor).
         mock_adapter._handle_dm.assert_not_called()
+
+
+class TestNIP09Deletion:
+    """NIP-09: kind 5 deletion requests tombstone referenced events."""
+
+    async def test_kind_5_records_deleted_event_ids(self, mock_adapter, keypair):
+        """A kind 5 event records the e-tagged event IDs as deleted."""
+        router = EventRouter(mock_adapter)
+        deletion = signed_event(
+            5, "deleted", keypair["pubkey"], keypair["hex"],
+            tags=[["e", "target_event_1"], ["e", "target_event_2"]],
+        )
+        await router.route(deletion, "wss://test.relay")
+        assert "target_event_1" in router._deleted_ids
+        assert "target_event_2" in router._deleted_ids
+
+    async def test_deleted_event_is_dropped(self, mock_adapter, keypair):
+        """An event whose ID is tombstoned by a prior kind 5 must not route."""
+        router = EventRouter(mock_adapter)
+        # First, tombstone a note.
+        note = signed_event(
+            1, "doomed message", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        deletion = signed_event(
+            5, "deleting my note", keypair["pubkey"], keypair["hex"],
+            tags=[["e", note["id"]]],
+        )
+        await router.route(deletion, "wss://test.relay")
+        # Now route the note — it should be dropped (tombstoned).
+        await router.route(note, "wss://test.relay")
+        mock_adapter._handle_mention.assert_not_called()
+
+    async def test_kind_5_from_wrong_pubkey_cannot_delete(self, mock_adapter, keypair):
+        """NIP-09: only the original author can delete. A kind 5 from a
+        different pubkey must not tombstone another author's event."""
+        router = EventRouter(mock_adapter)
+        impostor = PrivateKey()
+        # Author's note.
+        note = signed_event(
+            1, "real note", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        # Impostor tries to delete it.
+        deletion = signed_event(
+            5, "deleting someone else's note",
+            impostor.public_key.hex(), impostor.hex(),
+            tags=[["e", note["id"]]],
+        )
+        await router.route(deletion, "wss://test.relay")
+        # The note must still route (impostor's deletion ignored).
+        await router.route(note, "wss://test.relay")
+        mock_adapter._handle_mention.assert_called_once_with(note)
