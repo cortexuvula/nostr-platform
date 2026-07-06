@@ -485,3 +485,202 @@ class TestJumbleGiftWrap:
         exp_tags = [t for t in gw["tags"] if t[0] == "expiration"]
         assert len(exp_tags) == 1
         assert int(exp_tags[0][1]) > now
+
+
+class TestErrorBranches:
+    """Cover the defensive error branches in crypto.py (padding, HKDF,
+    decrypt, unwrap). All pure-logic — no I/O mocking needed."""
+
+    def test_hkdf_extract_empty_salt(self):
+        """_hkdf_extract handles empty salt (defaults to 32 zero bytes)."""
+        from plugins.platforms.nostr.crypto import _hkdf_extract
+        result = _hkdf_extract(b"", b"ikm")
+        assert len(result) == 32  # SHA-256 output
+
+    def test_calc_padded_len_small_input(self):
+        """_calc_padded_len returns 32 for inputs <= 32."""
+        from plugins.platforms.nostr.crypto import _calc_padded_len
+        assert _calc_padded_len(1) == 32
+        assert _calc_padded_len(32) == 32
+
+    def test_pad_too_short(self):
+        """_pad raises on empty plaintext."""
+        from plugins.platforms.nostr.crypto import _pad
+        with pytest.raises(ValueError, match="too short"):
+            _pad(b"")
+
+    def test_pad_too_long(self):
+        """_pad raises on plaintext > 65535 bytes."""
+        from plugins.platforms.nostr.crypto import _pad
+        with pytest.raises(ValueError, match="too long"):
+            _pad(b"\x00" * 65536)
+
+    def test_unpad_too_short(self):
+        """_unpad raises on padded data < 2 bytes."""
+        from plugins.platforms.nostr.crypto import _unpad
+        with pytest.raises(ValueError, match="too short"):
+            _unpad(b"")
+
+    def test_unpad_invalid_length(self):
+        """_unpad raises when declared length is out of range."""
+        from plugins.platforms.nostr.crypto import _unpad
+        with pytest.raises(ValueError, match="Invalid plaintext length"):
+            _unpad(b"\x00\x00")  # declared length 0
+
+    def test_unpad_shorter_than_declared(self):
+        """_unpad raises when data is shorter than the declared length."""
+        from plugins.platforms.nostr.crypto import _unpad
+        with pytest.raises(ValueError, match="shorter than declared"):
+            _unpad(b"\x00\x0a" + b"hi")  # declares 10, only 2 bytes
+
+    def test_unpad_nonzero_padding(self):
+        """_unpad raises when padding bytes are non-zero."""
+        from plugins.platforms.nostr.crypto import _unpad, _calc_padded_len
+        import struct
+        unpadded_len = 1
+        padded_len = _calc_padded_len(unpadded_len)
+        # Build: [u16 len=1][1 byte plaintext][padding with a non-zero byte]
+        data = struct.pack(">H", unpadded_len) + b"a"
+        data += b"\x00" * (padded_len - unpadded_len - 1) + b"\xff"
+        with pytest.raises(ValueError, match="non-zero"):
+            _unpad(data)
+
+    def test_unpad_wrong_total_size(self):
+        """_unpad raises when padded length doesn't match expected size."""
+        from plugins.platforms.nostr.crypto import _unpad
+        with pytest.raises(ValueError, match="expected size"):
+            _unpad(b"\x00\x01" + b"a" + b"\x00" * 5)  # too short for 32
+
+    def test_nip44_decrypt_payload_too_short(self):
+        """nip44_decrypt raises on payload < 99 bytes."""
+        from plugins.platforms.nostr.crypto import nip44_decrypt
+        import base64
+        with pytest.raises(ValueError, match="payload length"):
+            nip44_decrypt(base64.b64encode(b"short").decode(), "a" * 64, "b" * 64)
+
+    def test_nip44_decrypt_wrong_version(self):
+        """nip44_decrypt raises on unsupported version byte."""
+        from plugins.platforms.nostr.crypto import nip44_decrypt, MIN_PAYLOAD_SIZE
+        import base64
+        payload = bytes([0x01]) + b"\x00" * (MIN_PAYLOAD_SIZE - 1)
+        with pytest.raises(ValueError, match="version"):
+            nip44_decrypt(base64.b64encode(payload).decode(), "a" * 64, "b" * 64)
+
+    def test_verify_event_malformed(self):
+        """EventSigner.verify_event returns False on malformed input."""
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey
+        signer = EventSigner(PrivateKey().bech32())
+        assert signer.verify_event({}) is False
+
+    def test_unwrap_wrong_kind(self):
+        """unwrap_gift_wrap returns None for non-1059 events."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap
+        from pynostr.key import PrivateKey
+        nsec = PrivateKey().bech32()
+        assert unwrap_gift_wrap({"kind": 1}, nsec) is None
+
+    def test_unwrap_not_addressed_to_us(self):
+        """unwrap_gift_wrap returns None when no p-tag matches our pubkey."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap
+        from pynostr.key import PrivateKey
+        sk = PrivateKey()
+        other = PrivateKey().public_key.hex()
+        event = {"kind": 1059, "pubkey": other,
+                 "tags": [["p", other]], "content": ""}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_empty_sender_pubkey(self):
+        """unwrap_gift_wrap returns None when sender pubkey is empty."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap
+        from pynostr.key import PrivateKey
+        sk = PrivateKey()
+        event = {"kind": 1059, "pubkey": "",
+                 "tags": [["p", sk.public_key.hex()]], "content": ""}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_all_keys_fail(self):
+        """unwrap_gift_wrap returns None when no candidate key decrypts."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap
+        from pynostr.key import PrivateKey
+        import base64, os
+        sk = PrivateKey()
+        sender = PrivateKey()
+        # Valid-length payload that will fail MAC verification.
+        payload = base64.b64encode(
+            bytes([0x02]) + os.urandom(98)
+        ).decode()
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": payload}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_seal_not_json(self):
+        """unwrap_gift_wrap returns None when seal decrypts to non-JSON."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap, nip44_encrypt
+        from pynostr.key import PrivateKey
+        sk = PrivateKey()
+        sender = PrivateKey()
+        content = nip44_encrypt("not_json{", sender.hex(), sk.public_key.hex())
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": content}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_seal_wrong_kind(self):
+        """unwrap_gift_wrap returns None when seal kind != 13."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap, nip44_encrypt
+        from pynostr.key import PrivateKey
+        import json
+        sk = PrivateKey()
+        sender = PrivateKey()
+        seal = {"kind": 99}
+        content = nip44_encrypt(json.dumps(seal), sender.hex(), sk.public_key.hex())
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": content}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_seal_no_pubkey(self):
+        """unwrap_gift_wrap returns None when seal has no pubkey."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap, nip44_encrypt
+        from pynostr.key import PrivateKey
+        import json
+        sk = PrivateKey()
+        sender = PrivateKey()
+        seal = {"kind": 13}  # no pubkey field
+        content = nip44_encrypt(json.dumps(seal), sender.hex(), sk.public_key.hex())
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": content}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_seal_bad_signature(self):
+        """unwrap_gift_wrap returns None when seal signature is invalid."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap, nip44_encrypt
+        from pynostr.key import PrivateKey
+        import json
+        sk = PrivateKey()
+        sender = PrivateKey()
+        # Seal with valid structure but bogus signature.
+        seal = {
+            "kind": 13, "pubkey": sender.public_key.hex(), "content": "x",
+            "sig": "00" * 64, "id": "00" * 32, "created_at": 1, "tags": [],
+        }
+        content = nip44_encrypt(json.dumps(seal), sender.hex(), sk.public_key.hex())
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": content}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
+    def test_unwrap_rumor_decrypt_fail(self):
+        """unwrap_gift_wrap returns None when seal content can't be decrypted."""
+        from plugins.platforms.nostr.crypto import (
+            unwrap_gift_wrap, nip44_encrypt, EventSigner,
+        )
+        from pynostr.key import PrivateKey
+        import json
+        sk = PrivateKey()
+        sender = PrivateKey()
+        # Build a properly-signed seal with garbage content.
+        signer = EventSigner(sender.bech32())
+        seal = signer.sign_event(kind=13, content="garbage_not_valid_b64", tags=[])
+        content = nip44_encrypt(json.dumps(seal), sender.hex(), sk.public_key.hex())
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]], "content": content}
+        assert unwrap_gift_wrap(event, sk.bech32()) is None

@@ -702,3 +702,307 @@ class TestJumbleIntegration:
         assert p_values == [peer], "standard user gets single main-pubkey p-tag"
 
 
+class TestEnvAndConfigHelpers:
+    """Cover env_enablement, check_requirements, is_connected, hex/npub utils."""
+
+    def test_env_enablement_parses_env(self, monkeypatch):
+        """_env_enablement reads relay + feature flags from env."""
+        from plugins.platforms.nostr.adapter import _env_enablement
+        monkeypatch.setenv("NOSTR_RELAYS", "wss://a.com, wss://b.com")
+        monkeypatch.setenv("NOSTR_MONITOR_MENTIONS", "true")
+        monkeypatch.setenv("NOSTR_REPLY_PUBLICLY", "yes")
+        monkeypatch.setenv("NOSTR_REQUIRE_NIP05", "1")
+        monkeypatch.setenv("NOSTR_LEGACY_DM", "false")
+        monkeypatch.setenv("NOSTR_HOME_CHANNEL", "npub1home")
+        result = _env_enablement()
+        assert result["extra"]["relays"] == ["wss://a.com", "wss://b.com"]
+        assert result["extra"]["monitor_mentions"] is True
+        assert result["extra"]["reply_publicly"] is True
+        assert result["extra"]["require_nip05"] is True
+        assert result["extra"]["legacy_dm"] is False
+        assert result["home_channel"] == "npub1home"
+
+    def test_env_enablement_no_relays_no_home(self, monkeypatch):
+        """_env_enablement handles unset relays and home channel."""
+        from plugins.platforms.nostr.adapter import _env_enablement
+        monkeypatch.delenv("NOSTR_RELAYS", raising=False)
+        monkeypatch.delenv("NOSTR_HOME_CHANNEL", raising=False)
+        result = _env_enablement()
+        assert "relays" not in result["extra"]
+        assert "home_channel" not in result
+
+    def test_check_requirements(self, monkeypatch):
+        """check_requirements returns NOSTR_AVAILABLE."""
+        import plugins.platforms.nostr.adapter as mod
+        from plugins.platforms.nostr.adapter import check_requirements
+        monkeypatch.setattr(mod, "NOSTR_AVAILABLE", True)
+        assert check_requirements() is True
+        monkeypatch.setattr(mod, "NOSTR_AVAILABLE", False)
+        assert check_requirements() is False
+
+    def test_is_connected_truth_table(self, monkeypatch):
+        """is_connected returns True only when both env vars are set."""
+        from plugins.platforms.nostr.adapter import is_connected
+        monkeypatch.setenv("NOSTR_NSEC", "x")
+        monkeypatch.setenv("NOSTR_RELAYS", "wss://a")
+        assert is_connected(None) is True
+        monkeypatch.delenv("NOSTR_RELAYS", raising=False)
+        assert is_connected(None) is False
+
+    def test_hex_npub_roundtrip(self):
+        """_hex_to_npub and _npub_to_hex roundtrip correctly."""
+        from pynostr.key import PrivateKey
+        from plugins.platforms.nostr.adapter import _npub_to_hex, _hex_to_npub
+        sk = PrivateKey()
+        npub = sk.public_key.bech32()
+        hex_key = _npub_to_hex(npub)
+        assert _hex_to_npub(hex_key) == npub
+
+    def test_format_message_returns_input(self, mock_env):
+        """format_message returns content unchanged."""
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        assert adapter.format_message("hello world") == "hello world"
+
+
+class TestSendErrorPaths:
+    """Cover send() early-return error paths."""
+
+    def _make_adapter(self, mock_env, monkeypatch):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://r"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.publish = AsyncMock()
+        return adapter
+
+    async def test_send_no_message_text(self, mock_env, monkeypatch):
+        """send() returns failure when no message text is provided."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        result = await adapter.send(chat_id="pk", content=None)
+        assert result.success is False
+        assert "No message text" in result.error
+
+    async def test_send_typing_is_noop(self, mock_env, monkeypatch):
+        """send_typing is a no-op that completes without error."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        await adapter.send_typing("pk")  # must not raise
+
+    async def test_send_image_delegates_to_send(self, mock_env, monkeypatch):
+        """send_image assembles text and delegates to send."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.send = AsyncMock()
+        await adapter.send_image("pk", "https://img.example/x.png", "caption")
+        adapter.send.assert_awaited_once()
+        sent_text = adapter.send.await_args.args[1]
+        assert "caption" in sent_text
+        assert "https://img.example/x.png" in sent_text
+
+    async def test_send_image_without_caption(self, mock_env, monkeypatch):
+        """send_image with no caption sends just the URL."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.send = AsyncMock()
+        await adapter.send_image("pk", "https://img.example/y.png")
+        sent_text = adapter.send.await_args.args[1]
+        assert sent_text == "https://img.example/y.png"
+
+    async def test_get_chat_info(self, mock_env, monkeypatch):
+        """get_chat_info returns profile-based dict."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.profiles = MagicMock()
+        adapter.profiles.get_profile = AsyncMock(
+            return_value={"name": "Alice", "nip05": "alice@x.com"}
+        )
+        info = await adapter.get_chat_info("pk123")
+        assert info["name"] == "Alice"
+        assert info["type"] == "dm"
+        assert info["chat_id"] == "pk123"
+
+    async def test_get_chat_info_fallback_name(self, mock_env, monkeypatch):
+        """get_chat_info falls back to truncated pubkey when no name."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.profiles = MagicMock()
+        adapter.profiles.get_profile = AsyncMock(return_value={})
+        info = await adapter.get_chat_info("abcdef0123456789")
+        assert info["name"] == "abcdef012345..."  # chat_id[:12] + "..."
+
+
+class TestStandaloneHelpers:
+    """Cover module-level standalone helper functions."""
+
+    async def test_query_recipient_relays_10050_hit(self):
+        """_query_recipient_relays returns relay tags from kind 10050."""
+        from plugins.platforms.nostr.adapter import _query_recipient_relays
+        pool = MagicMock()
+        pool.query = AsyncMock(return_value=[
+            {"tags": [["relay", "wss://a"], ["relay", "wss://b"]]}
+        ])
+        result = await _query_recipient_relays(pool, "pk")
+        assert result == ["wss://a", "wss://b"]
+
+    async def test_query_recipient_relays_10002_fallback(self):
+        """_query_recipient_relays falls back to kind 10002 read relays."""
+        from plugins.platforms.nostr.adapter import _query_recipient_relays
+        pool = MagicMock()
+        pool.query = AsyncMock(side_effect=[
+            [],  # 10050 empty
+            [{"tags": [["r", "wss://read", "read"], ["r", "wss://write", "write"]]}],
+        ])
+        result = await _query_recipient_relays(pool, "pk")
+        assert "wss://read" in result
+        assert "wss://write" not in result
+
+    async def test_query_recipient_relays_query_fails(self):
+        """_query_recipient_relays swallows query errors and returns []."""
+        from plugins.platforms.nostr.adapter import _query_recipient_relays
+        pool = MagicMock()
+        pool.query = AsyncMock(side_effect=RuntimeError("down"))
+        result = await _query_recipient_relays(pool, "pk")
+        assert result == []
+
+    async def test_query_recipient_encryption_pubkey_found(self):
+        """_query_recipient_encryption_pubkey returns n-tag from 10044."""
+        from plugins.platforms.nostr.adapter import _query_recipient_encryption_pubkey
+        pool = MagicMock()
+        pool.query = AsyncMock(return_value=[
+            {"tags": [["n", "enc123"]]}
+        ])
+        result = await _query_recipient_encryption_pubkey(pool, "pk")
+        assert result == "enc123"
+
+    async def test_query_recipient_encryption_pubkey_none(self):
+        """_query_recipient_encryption_pubkey returns None when no 10044."""
+        from plugins.platforms.nostr.adapter import _query_recipient_encryption_pubkey
+        pool = MagicMock()
+        pool.query = AsyncMock(return_value=[])
+        result = await _query_recipient_encryption_pubkey(pool, "pk")
+        assert result is None
+
+    def test_load_persisted_encryption_key_missing(self, monkeypatch):
+        """_load_persisted_encryption_key returns None when file missing."""
+        from pathlib import Path
+        import plugins.platforms.nostr.adapter as mod
+        from plugins.platforms.nostr.adapter import _load_persisted_encryption_key
+        # Point the file at a nonexistent path.
+        monkeypatch.setattr(mod, "_ENC_KEY_FILE", Path("/nonexistent/path/key.json"))
+        assert _load_persisted_encryption_key() is None
+
+
+class TestAdapterInternals:
+    """Cover persistence helpers, publish helpers, resolve error paths,
+    and connect guards."""
+
+    def _make_adapter(self, mock_env, monkeypatch):
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {"relays": ["wss://r"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.publish = AsyncMock()
+        adapter.relay_pool.publish_to = AsyncMock()
+        adapter.relay_pool.query = AsyncMock(return_value=[])
+        return adapter
+
+    def test_load_legacy_peers_missing_file(self, monkeypatch):
+        """_load_legacy_peers returns empty set when file missing."""
+        from pathlib import Path
+        import plugins.platforms.nostr.adapter as mod
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        monkeypatch.setattr(mod, "_LEGACY_PEERS_FILE",
+                            Path("/nonexistent/peers.json"))
+        config = MagicMock()
+        config.extra = {}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        assert adapter._legacy_peers == set()
+
+    async def test_publish_dm_relays(self, mock_env, monkeypatch):
+        """_publish_dm_relays signs and publishes a kind 10050 event."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.publish = AsyncMock(
+            return_value={"wss://r": {"accepted": True}}
+        )
+        await adapter._publish_dm_relays()
+        adapter.relay_pool.publish.assert_awaited_once()
+        event = adapter.relay_pool.publish.await_args.args[0]
+        assert event["kind"] == 10050
+        assert any(t[0] == "relay" for t in event["tags"])
+
+    async def test_publish_dm_relays_failure_swallowed(self, mock_env, monkeypatch):
+        """_publish_dm_relays swallows publish errors."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.publish = AsyncMock(side_effect=RuntimeError("down"))
+        await adapter._publish_dm_relays()  # must not raise
+
+    async def test_publish_encryption_key(self, mock_env, monkeypatch):
+        """_publish_encryption_key signs and publishes a kind 10044 event."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.publish = AsyncMock(
+            return_value={"wss://r": {"accepted": True}}
+        )
+        await adapter._publish_encryption_key()
+        adapter.relay_pool.publish.assert_awaited_once()
+        event = adapter.relay_pool.publish.await_args.args[0]
+        assert event["kind"] == 10044
+        assert any(t[0] == "n" for t in event["tags"])
+
+    async def test_publish_encryption_key_failure_swallowed(
+        self, mock_env, monkeypatch
+    ):
+        """_publish_encryption_key swallows publish errors."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.publish = AsyncMock(side_effect=RuntimeError("down"))
+        await adapter._publish_encryption_key()  # must not raise
+
+    async def test_resolve_recipient_relays_query_fails(
+        self, mock_env, monkeypatch
+    ):
+        """_resolve_recipient_relays returns [] when queries fail."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.query = AsyncMock(side_effect=RuntimeError("down"))
+        peer = PrivateKey().public_key.hex()
+        result = await adapter._resolve_recipient_relays(peer)
+        assert result == []
+
+    async def test_resolve_recipient_encryption_query_fails(
+        self, mock_env, monkeypatch
+    ):
+        """_resolve_recipient_encryption_pubkey returns None on query fail."""
+        from pynostr.key import PrivateKey
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.query = AsyncMock(side_effect=RuntimeError("down"))
+        peer = PrivateKey().public_key.hex()
+        result = await adapter._resolve_recipient_encryption_pubkey(peer)
+        assert result is None
+
+    async def test_connect_returns_false_no_signer(self, monkeypatch):
+        """connect() returns False when no nsec configured."""
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        monkeypatch.setenv("NOSTR_NSEC", "")
+        monkeypatch.setenv("NOSTR_RELAYS", "wss://r")
+        config = MagicMock()
+        config.extra = {}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        result = await adapter.connect()
+        assert result is False
+
+    async def test_connect_returns_false_no_relays(self, mock_env, monkeypatch):
+        """connect() returns False when no relays configured."""
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        config = MagicMock()
+        config.extra = {}
+        monkeypatch.setenv("NOSTR_RELAYS", "")  # no relays anywhere
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        result = await adapter.connect()
+        assert result is False
+
+

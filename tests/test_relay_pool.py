@@ -482,3 +482,309 @@ class TestNIP42Auth:
         pool._authenticate.assert_awaited_once_with(conn)
 
 
+class TestRelayConnectionLifecycle:
+    """Cover RelayConnection connect/disconnect/send_raw branches."""
+
+    async def test_connect_without_websockets_returns_false(self, monkeypatch):
+        """connect() returns False when websockets package unavailable."""
+        import plugins.platforms.nostr.relay_pool as rp
+        monkeypatch.setattr(rp, "WEBSOCKETS_AVAILABLE", False)
+        conn = RelayConnection("wss://x.example.com")
+        result = await conn.connect()
+        assert result is False
+        assert conn.connected is False
+
+    async def test_disconnect_cancels_listen_task(self):
+        """disconnect() cancels and awaits a running listen task."""
+        conn = RelayConnection("wss://x.example.com")
+        conn._listen_task = asyncio.create_task(asyncio.Event().wait())
+        await conn.disconnect()
+        assert conn._listen_task.cancelled() or conn._listen_task.done()
+        assert conn.ws is None
+        assert conn.connected is False
+
+    async def test_disconnect_swallow_ws_close_error(self):
+        """disconnect() swallows errors from ws.close()."""
+        from unittest.mock import AsyncMock
+        conn = RelayConnection("wss://x.example.com")
+        conn.ws = type("FakeWS", (), {"close": AsyncMock(side_effect=RuntimeError)})()
+        conn.connected = True
+        await conn.disconnect()  # must not raise
+        assert conn.ws is None
+
+    async def test_send_raw_error_flips_connected(self):
+        """send_raw logs and sets connected=False when ws.send raises."""
+        from unittest.mock import AsyncMock
+        conn = RelayConnection("wss://x.example.com")
+        conn.ws = type("FakeWS", (), {"send": AsyncMock(side_effect=RuntimeError)})()
+        conn.connected = True
+        await conn.send_raw("[]")  # must not raise
+        assert conn.connected is False
+
+    async def test_send_raw_noop_when_not_connected(self):
+        """send_raw is a no-op when ws is None or not connected."""
+        conn = RelayConnection("wss://x.example.com")
+        conn.ws = None
+        conn.connected = False
+        await conn.send_raw("[]")  # must not raise
+
+
+class TestHandleMessageArms:
+    """Cover _handle_message edge-case branches."""
+
+    async def test_empty_message_ignored(self):
+        """An empty or non-list message is ignored."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        await pool._handle_message(conn, [])
+        await pool._handle_message(conn, "not-a-list")
+        await pool._handle_message(conn, None)
+
+    async def test_event_too_short_ignored(self):
+        """An EVENT with < 3 elements is ignored."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        await pool._handle_message(conn, ["EVENT", "sub1"])
+
+    async def test_event_no_id_ignored(self):
+        """An EVENT with no event id is ignored."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        await pool._handle_message(conn, ["EVENT", "sub1", {"content": "x"}])
+
+    async def test_event_routed_to_global_stream(self):
+        """A non-query EVENT is routed to the global event queue."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        await pool._handle_message(conn, ["EVENT", "sub1", {"id": "ev1"}])
+        assert pool._event_queue.qsize() == 1
+
+    async def test_notice_logged(self):
+        """A NOTICE message is handled without error."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        await pool._handle_message(conn, ["NOTICE", "hello world"])
+        await pool._handle_message(conn, ["NOTICE"])
+
+    async def test_ok_too_short_ignored(self):
+        """An OK with < 3 elements is ignored."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        await pool._handle_message(conn, ["OK", "ev1"])
+
+    async def test_closed_plain_resubscribes(self):
+        """A CLOSED with a generic reason triggers _resubscribe_after."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+        pool._subscriptions.append(({"kinds": [1]}, "sub_1"))
+        pool._resubscribe_after = AsyncMock()
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "error: transient"])
+        await asyncio.sleep(0)
+        pool._resubscribe_after.assert_awaited_once()
+
+    async def test_closed_no_match_no_resubscribe(self):
+        """A CLOSED for an unknown sub_id does not resubscribe."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        pool._resubscribe_after = AsyncMock()
+        await pool._handle_message(conn, ["CLOSED", "unknown_sub", "error"])
+        pool._resubscribe_after.assert_not_called()
+
+
+class TestSubscribeAndPublishHelpers:
+    """Cover subscribe connected-send, publish_to empty, auth error arms."""
+
+    async def test_subscribe_sends_to_connected(self):
+        """subscribe() sends REQ to connected relays."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        conn.send_raw = AsyncMock()
+        pool.connections[conn.url] = conn
+        await pool.subscribe([{"kinds": [1]}])
+        conn.send_raw.assert_awaited_once()
+
+    async def test_publish_to_empty_urls_returns_empty(self):
+        """publish_to with empty urls returns {}."""
+        pool = RelayPool([])
+        result = await pool.publish_to({"id": "x"}, [])
+        assert result == {}
+
+    async def test_authenticate_timeout_returns_false(self):
+        """_authenticate returns False on timeout (no OK received)."""
+        from plugins.platforms.nostr.crypto import EventSigner
+        from pynostr.key import PrivateKey
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool.set_signer(EventSigner(PrivateKey().bech32()))
+        conn = RelayConnection("wss://x")
+        conn.challenge = "c"
+        conn.send_raw = AsyncMock()
+        result = await pool._authenticate(conn, timeout=0.1)
+        assert result is False
+
+    async def test_auth_then_resubscribe_skips_when_not_running(self):
+        """_auth_then_resubscribe returns early when pool not running."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = False
+        conn = RelayConnection("wss://x")
+        pool._authenticate = AsyncMock()
+        await pool._auth_then_resubscribe(conn, "sub1", "auth-required")
+        pool._authenticate.assert_not_called()
+
+    async def test_cancel_listen_tasks_logs_non_cancelled_error(self, caplog):
+        """_cancel_listen_tasks logs (not swallows) a non-CancelledError."""
+        import logging
+        pool = RelayPool([])
+
+        async def boom():
+            raise RuntimeError("kaboom")
+        task = asyncio.create_task(boom())
+        # Let the task run to completion (with its exception) before
+        # _cancel_listen_tasks cancels+awaits it, so the RuntimeError is the
+        # surfaced exception rather than a CancelledError.
+        await asyncio.sleep(0)
+        pool._listen_tasks = [task]
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.nostr.relay_pool"):
+            await pool._cancel_listen_tasks()
+        assert any("kaboom" in r.message for r in caplog.records)
+
+
+class TestListenRelayAndPublishOnce:
+    """Cover _listen_relay (fake ws iterator), _publish_once recv loop,
+    and _resubscribe_after retry loop."""
+
+    async def test_listen_relay_processes_frames(self):
+        """_listen_relay iterates ws frames and dispatches to _handle_message."""
+        import json as _json
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+
+        frames = [_json.dumps(["OK", "ev1", True, ""]), "not-json",
+                  _json.dumps(["NOTICE", "hi"])]
+        class FakeWS:
+            def __aiter__(self):
+                self._i = 0
+                return self
+            async def __anext__(self):
+                if self._i >= len(frames):
+                    raise StopAsyncIteration
+                f = frames[self._i]
+                self._i += 1
+                return f
+        conn.ws = FakeWS()
+        # Should complete without raising despite the invalid JSON frame.
+        await pool._listen_relay(conn)
+        assert conn.connected is False  # finally block sets this
+
+    async def test_publish_once_success(self, monkeypatch):
+        """_publish_once sends EVENT, receives OK, returns accepted=True."""
+        import json as _json
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        event = {"id": "target1", "kind": 1, "content": "x"}
+
+        ok_frame = _json.dumps(["OK", "target1", True, ""])
+        class FakeWS:
+            async def recv(self):
+                return ok_frame
+            async def close(self):
+                pass
+        async def fake_connect(self):
+            self.ws = FakeWS()
+            self.connected = True
+            return True
+        monkeypatch.setattr(RelayConnection, "connect", fake_connect)
+        monkeypatch.setattr(RelayConnection, "disconnect", AsyncMock())
+
+        result = await pool._publish_once("wss://relay.example.com", event, timeout=2.0)
+        assert result["accepted"] is True
+
+    async def test_publish_once_timeout(self, monkeypatch):
+        """_publish_once returns accepted=False on timeout (recv parks)."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        event = {"id": "target2", "kind": 1}
+
+        class FakeWS:
+            async def recv(self):
+                await asyncio.sleep(10)  # park forever
+            async def close(self):
+                pass
+        async def fake_connect(self):
+            self.ws = FakeWS()
+            self.connected = True
+            return True
+        monkeypatch.setattr(RelayConnection, "connect", fake_connect)
+        monkeypatch.setattr(RelayConnection, "disconnect", AsyncMock())
+
+        result = await pool._publish_once("wss://relay.example.com", event, timeout=0.2)
+        assert result["accepted"] is False
+        assert "timeout" in result["message"]
+
+    async def test_publish_once_connect_fail(self, monkeypatch):
+        """_publish_once returns accepted=False when connect fails."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        async def fake_connect(self):
+            return False
+        monkeypatch.setattr(RelayConnection, "connect", fake_connect)
+        monkeypatch.setattr(RelayConnection, "disconnect", AsyncMock())
+        result = await pool._publish_once("wss://down.example.com",
+                                           {"id": "x"}, timeout=1.0)
+        assert result["accepted"] is False
+        assert "connect" in result["message"]
+
+    async def test_resubscribe_after_success(self, monkeypatch):
+        """_resubscribe_after retries and succeeds."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+        pool._subscriptions.append(({"kinds": [1]}, "sub_99"))
+        conn.send_raw = AsyncMock()
+        # Patch sleep to no-op so the test is instant.
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        await pool._resubscribe_after(conn, {"kinds": [1]}, "sub_99", "closed",
+                                       max_retries=2)
+        conn.send_raw.assert_awaited()
+
+    async def test_resubscribe_after_gives_up(self, monkeypatch):
+        """_resubscribe_after gives up after max_retries when send always fails."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool._subscriptions.append(({"kinds": [1]}, "sub_98"))
+        conn.send_raw = AsyncMock(side_effect=RuntimeError("down"))
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        # Should not raise; gives up after 2 attempts.
+        await pool._resubscribe_after(conn, {"kinds": [1]}, "sub_98", "closed",
+                                       max_retries=2)
+
+    async def test_events_generator_yields(self):
+        """events() yields items put on the event queue."""
+        pool = RelayPool([])
+        pool._running = True
+        await pool._event_queue.put(({"id": "a"}, "wss://r"))
+        gen = pool.events()
+        event, url = await gen.__anext__()
+        assert event == {"id": "a"}
+        assert url == "wss://r"
+        pool._running = False
+        await gen.aclose()
+

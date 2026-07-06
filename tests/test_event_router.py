@@ -400,3 +400,87 @@ class TestJumbleReceive:
         mock_adapter._handle_dm.assert_called_once()
         args = mock_adapter._handle_dm.call_args
         assert args[0][1] == "hello from jumble"
+
+
+class TestRouterErrorBranches:
+    """Cover the defensive error/debug branches in event_router.py."""
+
+    async def test_verify_signature_malformed_returns_false(self):
+        """_verify_signature returns False on malformed input."""
+        from plugins.platforms.nostr.event_router import _verify_signature
+        assert _verify_signature({}) is False
+        assert _verify_signature("not-a-dict") is False
+        assert _verify_signature(None) is False
+
+    async def test_gift_wrap_unwrap_fail_dropped(self, mock_adapter, keypair):
+        """A kind 1059 that fails to unwrap is silently dropped."""
+        router = EventRouter(mock_adapter)
+        event = {
+            "kind": 1059, "pubkey": keypair["pubkey"],
+            "tags": [["p", mock_adapter.pubkey]], "content": "garbage",
+        }
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_gift_wrap_empty_content_dropped(self, mock_adapter, keypair):
+        """A gift wrap whose rumor has empty content is dropped."""
+        from plugins.platforms.nostr.crypto import (
+            create_gift_wrap, create_dm_rumor,
+        )
+        router = EventRouter(mock_adapter)
+        rumor = {"kind": 14, "content": "", "pubkey": keypair["pubkey"],
+                 "tags": [["p", mock_adapter.pubkey]],
+                 "created_at": 1, "id": "", "sig": ""}
+        gw = create_gift_wrap(rumor, mock_adapter.pubkey, keypair["nsec"])
+        await router.route(gw, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_gift_wrap_non_dm_kind_ignored(self, mock_adapter, keypair):
+        """A gift wrap whose rumor kind isn't a DM (4/14/15) is ignored."""
+        from plugins.platforms.nostr.crypto import (
+            create_gift_wrap,
+        )
+        router = EventRouter(mock_adapter)
+        rumor = {"kind": 1, "content": "not a dm", "pubkey": keypair["pubkey"],
+                 "tags": [["p", mock_adapter.pubkey]],
+                 "created_at": 1, "id": "", "sig": ""}
+        gw = create_gift_wrap(rumor, mock_adapter.pubkey, keypair["nsec"])
+        await router.route(gw, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_legacy_dm_not_addressed_to_us_skipped(self, mock_adapter, keypair):
+        """A kind 4 DM not p-tagging us is skipped (no decrypt attempted)."""
+        router = EventRouter(mock_adapter)
+        other = PrivateKey().public_key.hex()
+        event = signed_event(
+            4, "encrypted-blob", keypair["pubkey"], keypair["hex"],
+            tags=[["p", other]],  # not us
+        )
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_legacy_dm_decrypt_fail_logged(self, mock_adapter, keypair):
+        """A kind 4 DM to us with undecryptable content is logged and dropped."""
+        router = EventRouter(mock_adapter)
+        event = signed_event(
+            4, "not-valid-nip04-content", keypair["pubkey"], keypair["hex"],
+            tags=[["p", mock_adapter.pubkey]],
+        )
+        await router.route(event, "wss://test.relay")
+        mock_adapter._handle_dm.assert_not_called()
+
+    async def test_metadata_no_pubkey_skipped(self, mock_adapter):
+        """A kind 0 with no pubkey is skipped."""
+        router = EventRouter(mock_adapter)
+        await router.route({"kind": 0, "content": "{}", "pubkey": ""},
+                            "wss://test.relay")
+        mock_adapter.profiles.update_from_event.assert_not_called()
+
+    async def test_metadata_invalid_json_skipped(self, mock_adapter, keypair):
+        """A kind 0 with invalid JSON content is skipped (not crashed)."""
+        router = EventRouter(mock_adapter)
+        event = signed_event(
+            0, "not-json", keypair["pubkey"], keypair["hex"],
+        )
+        await router.route(event, "wss://test.relay")
+        mock_adapter.profiles.update_from_event.assert_not_called()

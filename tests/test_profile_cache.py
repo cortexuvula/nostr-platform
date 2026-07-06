@@ -128,3 +128,69 @@ class TestNip05Verification:
         cache = ProfileCache(pool)
         assert await cache._nip05_lookup("pk", "not-an-identifier") is None
         assert await cache._nip05_lookup("pk", "") is None
+
+
+class TestProfileCacheExtra:
+    """Cover remaining branches: TTL miss, no-pool, update, clear, close,
+    NIP-05 verification failure in get_profile."""
+
+    async def test_fetch_returns_none_without_pool(self):
+        """_fetch_from_relays returns None when relay_pool is None."""
+        cache = ProfileCache(relay_pool=None)
+        result = await cache._fetch_from_relays("pk")
+        assert result is None
+
+    async def test_fetch_returns_none_when_query_raises(self, pool):
+        """_fetch_from_relays returns None when query raises."""
+        cache = ProfileCache(pool)
+        pool.query = AsyncMock(side_effect=RuntimeError("down"))
+        result = await cache._fetch_from_relays("pk")
+        assert result is None
+
+    async def test_update_from_event_populates_cache(self, pool):
+        """update_from_event stores profile data + fetched_at."""
+        cache = ProfileCache(pool)
+        await cache.update_from_event("pk1", {"name": "alice"})
+        assert cache.cache["pk1"]["name"] == "alice"
+        assert "fetched_at" in cache.cache["pk1"]
+
+    async def test_nip05_lookup_empty_parts(self, pool):
+        """_nip05_lookup returns None for empty name or domain."""
+        cache = ProfileCache(pool)
+        assert await cache._nip05_lookup("pk", "name@") is None
+        assert await cache._nip05_lookup("pk", "@domain") is None
+
+    async def test_get_profile_nullifies_failed_nip05(self, pool):
+        """get_profile sets nip05=None when verification fails."""
+        cache = ProfileCache(pool)
+        import json
+        pool.query = AsyncMock(return_value=[{
+            "created_at": 1,
+            "content": json.dumps({"name": "x", "nip05": "user@bad.example"}),
+        }])
+        # _nip05_lookup will fail (no network / bad domain) → nip05 nullified.
+        profile = await cache.get_profile("pk")
+        assert profile["nip05"] is None
+
+    async def test_clear_empties_cache(self, pool):
+        """clear() removes all cached entries."""
+        cache = ProfileCache(pool)
+        cache.cache["a"] = {"name": "x"}
+        cache.clear()
+        assert cache.cache == {}
+
+    async def test_close_closes_open_session(self, pool):
+        """close() closes an open aiohttp session."""
+        cache = ProfileCache(pool)
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        cache._http_session = session
+        await cache.close()
+        session.close.assert_awaited_once()
+        assert cache._http_session is None
+
+    async def test_close_noop_when_no_session(self, pool):
+        """close() is a no-op when no session exists."""
+        cache = ProfileCache(pool)
+        await cache.close()  # must not raise
