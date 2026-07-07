@@ -297,7 +297,6 @@ class RelayPool:
                 # Don't let an unexpected error kill the whole reconnect loop
                 # and orphan this relay forever; back off and try again.
                 logger.warning(f"Error in {conn.url} connect/listen cycle: {e}")
-                uptime = 0
                 conn._reconnect_attempts += 1
 
             delay = conn._reconnect_delay()

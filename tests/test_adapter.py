@@ -843,12 +843,12 @@ class TestEnvAndConfigHelpers:
         assert is_connected(None) is False
 
     def test_hex_npub_roundtrip(self):
-        """_hex_to_npub and _npub_to_hex roundtrip correctly."""
+        """_hex_to_npub and npub_to_hex roundtrip correctly."""
         from pynostr.key import PrivateKey
-        from plugins.platforms.nostr.adapter import _npub_to_hex, _hex_to_npub
+        from plugins.platforms.nostr.adapter import npub_to_hex, _hex_to_npub
         sk = PrivateKey()
         npub = sk.public_key.bech32()
-        hex_key = _npub_to_hex(npub)
+        hex_key = npub_to_hex(npub)
         assert _hex_to_npub(hex_key) == npub
 
     def test_format_message_returns_input(self, mock_env):

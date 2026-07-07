@@ -73,13 +73,8 @@ from .crypto import (
 
 
 # ---------------------------------------------------------------------------
-# Key utilities
+# Key utilities — npub_to_hex imported from .crypto; _hex_to_npub is local.
 # ---------------------------------------------------------------------------
-
-def _npub_to_hex(npub: str) -> str:
-    """Convert npub (bech32) to hex pubkey."""
-    return PublicKey.from_npub(npub).hex()
-
 
 def _hex_to_npub(hex_key: str) -> str:
     """Convert hex pubkey to npub (bech32)."""
@@ -194,7 +189,7 @@ class NostrAdapter(BasePlatformAdapter):
                 npub = npub.strip()
                 if npub:
                     try:
-                        self.allowed_users.add(_npub_to_hex(npub))
+                        self.allowed_users.add(npub_to_hex(npub))
                     except Exception:
                         logger.warning(
                             f"Could not parse npub in allowed users: "
@@ -930,7 +925,7 @@ async def _standalone_send_async(
 
         recipient = chat_id
         if recipient.startswith("npub1"):
-            recipient = _npub_to_hex(recipient)
+            recipient = npub_to_hex(recipient)
 
         our_pubkey = derive_pubkey(nsec)
 
