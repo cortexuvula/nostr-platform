@@ -285,30 +285,45 @@ class NostrAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _publish_dm_relays(self):
-        """Publish kind 10050 (NIP-17 DM relay list) so clients know where
-        to send gift-wrapped DMs to us.
+        """Publish kind 10050 (NIP-17 DM relay list) AND kind 10002 (NIP-65
+        relay list) so clients know where to send gift-wrapped DMs to us.
 
-        Per NIP-17, the event contains ``["relay", url]`` tags for each
-        relay we monitor for incoming DMs. Without this event, clients
-        like Jumble and Amethyst cannot determine where to send replies
-        and will report "user has not set up DM relays."
+        Per NIP-17, the kind 10050 event contains ``["relay", url]`` tags.
+        The kind 10002 (NIP-65) is also published because Amethyst's fallback
+        relay discovery checks NIP-65 read relays when a recipient's 10050
+        isn't found or its relays are unreachable. Without the 10002, DMs
+        from Amethyst users can be silently published to wrong relays.
         """
         if not self._signer or not self.relay_urls:
             return
 
-        tags = [["relay", url] for url in self.relay_urls]
-        event = self._signer.sign_event(
+        # Kind 10050: NIP-17 DM relay list (primary discovery mechanism).
+        dm_tags = [["relay", url] for url in self.relay_urls]
+        dm_event = self._signer.sign_event(
             kind=10050,
             content="",
-            tags=tags,
+            tags=dm_tags,
+        )
+        # Kind 10002: NIP-65 general relay list (fallback discovery). Mark
+        # all relays as both read and write so Amethyst's fallback finds them.
+        nip65_tags = [["r", url, "read"] for url in self.relay_urls]
+        for url in self.relay_urls:
+            nip65_tags.append(["r", url, "write"])
+        nip65_event = self._signer.sign_event(
+            kind=10002,
+            content="",
+            tags=nip65_tags,
         )
         try:
-            results = await self.relay_pool.publish(event, timeout=5.0)
+            results = await self.relay_pool.publish(dm_event, timeout=5.0)
             accepted = sum(1 for r in results.values() if r.get("accepted"))
             logger.info(
                 f"Published kind 10050 DM relay list to {accepted}/"
                 f"{len(results)} relays ({len(self.relay_urls)} relays listed)"
             )
+            # Also publish the NIP-65 relay list.
+            await self.relay_pool.publish(nip65_event, timeout=5.0)
+            logger.info("Published kind 10002 NIP-65 relay list")
         except Exception as e:
             logger.warning(f"Failed to publish DM relay list: {e}")
 

@@ -1001,10 +1001,41 @@ class TestAdapterInternals:
             return_value={"wss://r": {"accepted": True}}
         )
         await adapter._publish_dm_relays()
-        adapter.relay_pool.publish.assert_awaited_once()
-        event = adapter.relay_pool.publish.await_args.args[0]
-        assert event["kind"] == 10050
-        assert any(t[0] == "relay" for t in event["tags"])
+        # Now publishes both 10050 and 10002.
+        assert adapter.relay_pool.publish.await_count >= 1
+        # Find the 10050 event among the published events.
+        published = [c.args[0] for c in adapter.relay_pool.publish.await_args_list]
+        event_10050 = next((e for e in published if e["kind"] == 10050), None)
+        assert event_10050 is not None
+        assert any(t[0] == "relay" for t in event_10050["tags"])
+
+    async def test_publish_nip65_relay_list(self, mock_env, monkeypatch):
+        """_publish_dm_relays also publishes a kind 10002 (NIP-65) relay list
+        so Amethyst's fallback relay discovery finds the agent's inbox relays.
+        Without this, Amethyst users whose client can't read the 10050 fall
+        back to NIP-65 read relays — and if we haven't published one, their
+        DMs go to the wrong relays and are silently lost."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        adapter.relay_pool.publish = AsyncMock(
+            return_value={"wss://r": {"accepted": True}}
+        )
+        await adapter._publish_dm_relays()
+        # Should have published BOTH kind 10050 AND kind 10002.
+        published_kinds = [
+            call.args[0]["kind"]
+            for call in adapter.relay_pool.publish.await_args_list
+        ]
+        assert 10050 in published_kinds, "must publish kind 10050 (DM relay list)"
+        assert 10002 in published_kinds, (
+            "must publish kind 10002 (NIP-65 relay list) for Amethyst fallback"
+        )
+        # The 10002 event should have r-tags with read+write markers.
+        for call in adapter.relay_pool.publish.await_args_list:
+            ev = call.args[0]
+            if ev["kind"] == 10002:
+                r_tags = [t for t in ev["tags"] if t[0] == "r"]
+                assert len(r_tags) > 0, "10002 must have r-tags"
+                break
 
     async def test_publish_dm_relays_failure_swallowed(self, mock_env, monkeypatch):
         """_publish_dm_relays swallows publish errors."""
