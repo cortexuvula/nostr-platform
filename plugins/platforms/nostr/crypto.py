@@ -571,7 +571,7 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str,
     for pk_hex in candidate_privkeys:
         try:
             seal_json = nip44_decrypt(
-                gift_event["content"], pk_hex, sender_pubkey,
+                gift_event.get("content", ""), pk_hex, sender_pubkey,
             )
             working_privkey_hex = pk_hex
             break
@@ -612,7 +612,7 @@ def unwrap_gift_wrap(gift_event: dict, recipient_nsec: str,
 
     try:
         rumor_json = nip44_decrypt(
-            seal["content"], working_privkey_hex, seal_conv_pubkey,
+            seal.get("content", ""), working_privkey_hex, seal_conv_pubkey,
         )
     except Exception as e:
         logger.debug(f"Rumor decryption failed: {e}")

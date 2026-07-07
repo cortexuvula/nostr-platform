@@ -599,6 +599,17 @@ class TestErrorBranches:
                  "tags": [["p", sk.public_key.hex()]], "content": ""}
         assert unwrap_gift_wrap(event, sk.bech32()) is None
 
+    def test_unwrap_missing_content_returns_none(self):
+        """unwrap_gift_wrap returns None (not KeyError) when the gift wrap
+        event is missing the 'content' field — a malformed relay payload."""
+        from plugins.platforms.nostr.crypto import unwrap_gift_wrap
+        from pynostr.key import PrivateKey
+        sk = PrivateKey()
+        sender = PrivateKey()
+        event = {"kind": 1059, "pubkey": sender.public_key.hex(),
+                 "tags": [["p", sk.public_key.hex()]]}  # no "content" key
+        assert unwrap_gift_wrap(event, sk.bech32()) is None
+
     def test_unwrap_all_keys_fail(self):
         """unwrap_gift_wrap returns None when no candidate key decrypts."""
         from plugins.platforms.nostr.crypto import unwrap_gift_wrap
