@@ -636,6 +636,17 @@ class TestHandleMentionAuthorization:
         _, kwargs = adapter.build_source.call_args
         assert kwargs.get("thread_id") == "note_xyz"
 
+    async def test_known_peer_mention_accepted(self, mock_env, monkeypatch):
+        """A mention from a known peer (agent has sent them a DM) is accepted,
+        matching the _handle_dm authorization logic."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        adapter._known_peers.add(peer)
+        await adapter._handle_mention(
+            {"pubkey": peer, "content": "hi back", "id": "note_abc"}
+        )
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestJumbleIntegration:
     """Test Jumble kind-10044 compatibility — encryption keypair, recipient
@@ -1029,12 +1040,27 @@ class TestAdapterInternals:
         assert 10002 in published_kinds, (
             "must publish kind 10002 (NIP-65 relay list) for Amethyst fallback"
         )
-        # The 10002 event should have r-tags with read+write markers.
+        # The 10002 event should have exactly one r-tag per relay with NO
+        # marker (NIP-65: no marker = both read and write). Duplicate r-tags
+        # for the same URL are malformed.
         for call in adapter.relay_pool.publish.await_args_list:
             ev = call.args[0]
             if ev["kind"] == 10002:
                 r_tags = [t for t in ev["tags"] if t[0] == "r"]
-                assert len(r_tags) > 0, "10002 must have r-tags"
+                assert len(r_tags) == len(adapter.relay_urls), (
+                    f"expected {len(adapter.relay_urls)} r-tags, got {len(r_tags)}"
+                )
+                # Each r-tag should have exactly 2 elements (no marker).
+                for tag in r_tags:
+                    assert len(tag) == 2, (
+                        f"r-tag should be ['r', url] (no marker = both). "
+                        f"Got {tag}"
+                    )
+                # No duplicate URLs.
+                urls_in_tags = [t[1] for t in r_tags]
+                assert len(urls_in_tags) == len(set(urls_in_tags)), (
+                    "duplicate relay URLs in r-tags"
+                )
                 break
 
     async def test_publish_dm_relays_failure_swallowed(self, mock_env, monkeypatch):

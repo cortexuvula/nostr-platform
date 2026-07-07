@@ -304,11 +304,10 @@ class NostrAdapter(BasePlatformAdapter):
             content="",
             tags=dm_tags,
         )
-        # Kind 10002: NIP-65 general relay list (fallback discovery). Mark
-        # all relays as both read and write so Amethyst's fallback finds them.
-        nip65_tags = [["r", url, "read"] for url in self.relay_urls]
-        for url in self.relay_urls:
-            nip65_tags.append(["r", url, "write"])
+        # Kind 10002: NIP-65 general relay list (fallback discovery). A single
+        # ["r", url] tag per relay with no marker means both read and write
+        # (NIP-65 spec). This is simpler and avoids malformed duplicate tags.
+        nip65_tags = [["r", url] for url in self.relay_urls]
         nip65_event = self._signer.sign_event(
             kind=10002,
             content="",
@@ -614,8 +613,12 @@ class NostrAdapter(BasePlatformAdapter):
         content = event.get("content", "")
         note_id = event.get("id", "")
 
-        # Authorization
-        if not self.allow_all and sender_pubkey not in self.allowed_users:
+        # Authorization: accept mentions from allowed users OR known peers
+        # (matching _handle_dm's logic so mentions aren't dropped for peers
+        # the agent has conversed with).
+        if (not self.allow_all
+                and sender_pubkey not in self.allowed_users
+                and sender_pubkey not in self._known_peers):
             return
 
         sender_name = self.profiles.get_display_name(sender_pubkey)
