@@ -222,6 +222,10 @@ class NostrAdapter(BasePlatformAdapter):
         # these peers use nip04_encrypt so legacy-only clients can read them;
         # everyone else gets NIP-17 gift-wrapped replies.
         self._legacy_peers: set[str] = self._load_legacy_peers()
+        # Pubkeys the agent has sent a DM to. These peers are allowed to reply
+        # even if not in NOSTR_ALLOWED_USERS — makes bidirectional DMs work
+        # naturally (agent initiates → user can reply).
+        self._known_peers: set[str] = set()
         # Cache of recipient pubkey → (relay_urls, fetched_at) so we don't
         # re-query kind 10050 on every reply to the same peer. TTL-bounded.
         self._recipient_relay_cache: dict[str, tuple[list, float]] = {}
@@ -536,8 +540,13 @@ class NostrAdapter(BasePlatformAdapter):
         over the same wire format: "nip04" clients (legacy kind 4) only speak
         NIP-04, so replying with a NIP-17 gift-wrap would be invisible to them.
         """
-        # Authorization check
-        if not self.allow_all and sender_pubkey not in self.allowed_users:
+        # Authorization check: accept DMs from explicitly-allowed users OR
+        # from known peers (pubkeys the agent has actively sent a DM to).
+        # This makes bidirectional DMs work: agent sends to user → user can
+        # reply without needing to be pre-authorized in NOSTR_ALLOWED_USERS.
+        if (not self.allow_all
+                and sender_pubkey not in self.allowed_users
+                and sender_pubkey not in self._known_peers):
             logger.info(
                 f"Nostr: DM from unauthorized user {sender_pubkey[:16]}..."
             )
@@ -729,6 +738,9 @@ class NostrAdapter(BasePlatformAdapter):
                     self_event = create_gift_wrap(rumor, self.pubkey, self.nsec)
                 await self.relay_pool.publish(self_event)
                 dm_event = recipient_event
+            # Record this recipient as a known peer so they can reply even if
+            # not in NOSTR_ALLOWED_USERS (bidirectional DM support).
+            self._known_peers.add(recipient)
             return SendResult(
                 success=True,
                 message_id=dm_event.get("id"),

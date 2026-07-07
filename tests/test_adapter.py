@@ -581,6 +581,25 @@ class TestHandleDmAuthorization:
         assert allowed in adapter._legacy_peers
         adapter._save_legacy_peers.assert_called_once()
 
+    async def test_known_peer_can_reply(self, mock_env, monkeypatch):
+        """A pubkey the agent has sent a DM to (a 'known peer') can reply,
+        even if not in NOSTR_ALLOWED_USERS. This makes bidirectional DMs
+        work: agent sends to user → user can reply."""
+        adapter = self._make_adapter(mock_env, monkeypatch)
+        peer = PrivateKey().public_key.hex()
+        # Agent sends a DM to this peer (records them as a known peer).
+        adapter._resolve_recipient_encryption_pubkey = AsyncMock(return_value=None)
+        adapter._resolve_recipient_relays = AsyncMock(return_value=[])
+        adapter.relay_pool.publish_to = AsyncMock()
+        await adapter.send(chat_id=peer, content="hello")
+        assert peer in adapter._known_peers, (
+            "send() must record the recipient as a known peer"
+        )
+        # Now the peer replies — must be accepted even though not in
+        # allowed_users and allow_all is False.
+        await adapter._handle_dm(peer, "reply!", {"id": "ev1"})
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestHandleMentionAuthorization:
     """Cover _handle_mention authorization (adapter.py:494-525)."""
