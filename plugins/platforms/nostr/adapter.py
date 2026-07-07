@@ -431,14 +431,20 @@ class NostrAdapter(BasePlatformAdapter):
 
         await self.relay_pool.connect()
 
-        # Subscribe to our DMs (NIP-17 gift wraps)
-        # kind 1059 events with a p tag matching our pubkey
-        # No "since" — fetch recent events so we don't miss DMs that
-        # arrived while the gateway was down
+        # Subscribe to our DMs (NIP-17 gift wraps).
+        #
+        # The 'since' window is critical for reliable delivery: NIP-59 gift
+        # wraps are backdated up to 2 days for privacy, so a filter without
+        # 'since' + a hard 'limit' can return old backdated wraps that crowd
+        # out actually-new DMs — causing intermittent delivery failures
+        # (the root cause of unreliable DMs with Amethyst). We use a 9-day
+        # window (7 days of history + 2-day backdate margin, matching
+        # Amethyst's own filter) and NO hard limit so nothing gets crowded out.
+        dm_since = int(time.time()) - 9 * 86400  # 9 days
         dm_filter = {
             "kinds": [1059],
             "#p": [self.pubkey],
-            "limit": 50,
+            "since": dm_since,
         }
 
         filters = [dm_filter]
@@ -459,7 +465,7 @@ class NostrAdapter(BasePlatformAdapter):
             legacy_dm_filter = {
                 "kinds": [4],
                 "#p": [self.pubkey],
-                "limit": 50,
+                "since": dm_since,
             }
             filters.append(legacy_dm_filter)
 

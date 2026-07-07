@@ -1058,4 +1058,36 @@ class TestAdapterInternals:
         result = await adapter.connect()
         assert result is False
 
+    async def test_connect_dm_filter_has_since_and_no_limit(
+        self, mock_env, monkeypatch
+    ):
+        """The DM subscription must use a 'since' window (to reliably catch
+        backdated gift wraps) and must NOT use a hard 'limit' (which lets old
+        backdated wraps crowd out actually-new DMs). This is the root cause of
+        intermittent DM delivery with Amethyst."""
+        from plugins.platforms.nostr.adapter import NostrAdapter
+        import time as _time
+        config = MagicMock()
+        config.extra = {"relays": ["wss://r"]}
+        with patch("plugins.platforms.nostr.adapter.NOSTR_AVAILABLE", True):
+            adapter = NostrAdapter(config)
+        adapter.relay_pool = MagicMock()
+        adapter.relay_pool.connect = AsyncMock()
+        adapter.relay_pool.subscribe = AsyncMock()
+        adapter._publish_dm_relays = AsyncMock()
+        adapter._publish_encryption_key = AsyncMock()
+        before = int(_time.time())
+        await adapter.connect()
+        after = int(_time.time())
+        filters = adapter.relay_pool.subscribe.await_args.args[0]
+        dm_filter = next(f for f in filters if 1059 in f.get("kinds", []))
+        assert "since" in dm_filter, "DM filter must have 'since' to catch backdated wraps"
+        # since should be roughly now - 9 days (777600s). Allow generous bounds.
+        assert before - 800000 <= dm_filter["since"] <= after - 700000, (
+            f"since {dm_filter['since']} should be ~9 days before now"
+        )
+        assert "limit" not in dm_filter or dm_filter["limit"] is None, (
+            "DM filter must not use a hard limit — it crowds out backdated wraps"
+        )
+
 
