@@ -341,7 +341,8 @@ class EventSigner:
         self._privkey_hex = self._privkey.hex()
 
     def sign_event(self, kind: int, content: str,
-                   tags: list = None, created_at: int = None) -> dict:
+                   tags: Optional[list] = None,
+                   created_at: Optional[int] = None) -> dict:
         """Create, sign, and return a Nostr event dict."""
         if tags is None:
             tags = []

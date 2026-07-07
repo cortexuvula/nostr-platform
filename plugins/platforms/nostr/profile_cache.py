@@ -114,7 +114,10 @@ class ProfileCache:
         if not name or not domain:
             return None
 
-        url = f"https://{domain}/.well-known/nostr.json?name={name}"
+        # NIP-05: the local part is case-insensitive. Query with the
+        # lowercased name and match against the lowercased key.
+        name_lower = name.lower()
+        url = f"https://{domain}/.well-known/nostr.json?name={name_lower}"
         try:
             # Reuse a single session across lookups instead of creating
             # a new one each time (avoids socket / connection-pool churn).
@@ -131,7 +134,10 @@ class ProfileCache:
 
         names = data.get("names", {})
         # NIP-05: names[<name>] == pubkey hex confirms the identifier.
-        if names.get(name) == pubkey:
+        # The local part is case-insensitive — try the exact key, then
+        # fall back to a case-insensitive match.
+        matched_pk = names.get(name) or names.get(name_lower)
+        if matched_pk == pubkey:
             return {
                 "name": data.get("names", {}).get(name, name),
                 "nip05": identifier,

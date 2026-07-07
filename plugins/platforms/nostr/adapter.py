@@ -109,8 +109,18 @@ def validate_config(config) -> bool:
 
 
 def is_connected(config) -> bool:
-    """Check if the adapter has a valid nsec and relay list."""
-    return bool(os.getenv("NOSTR_NSEC") and os.getenv("NOSTR_RELAYS"))
+    """Check if the adapter has a valid nsec and relay list.
+
+    Checks both NOSTR_RELAYS env and config.extra['relays'], matching
+    validate_config's logic so the gateway doesn't report disconnected
+    when relays are configured via config.yaml instead of env vars.
+    """
+    if not os.getenv("NOSTR_NSEC"):
+        return False
+    if os.getenv("NOSTR_RELAYS"):
+        return True
+    extra = getattr(config, "extra", {}) or {}
+    return bool(extra.get("relays"))
 
 
 def _env_enablement():

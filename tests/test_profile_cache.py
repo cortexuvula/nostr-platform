@@ -129,6 +129,20 @@ class TestNip05Verification:
         assert await cache._nip05_lookup("pk", "not-an-identifier") is None
         assert await cache._nip05_lookup("pk", "") is None
 
+    async def test_nip05_case_insensitive_local_part(self, pool):
+        """NIP-05: the local part is case-insensitive. 'Alice@example.com'
+        must match a nostr.json entry keyed as 'alice'."""
+        cache = ProfileCache(pool)
+        # nostr.json has lowercase "alice" but the identifier uses "Alice".
+        session = _make_nip05_response({"names": {"alice": "pk_alice"}})
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await cache._nip05_lookup("pk_alice", "Alice@example.com")
+        assert result is not None, (
+            "NIP-05 local part must be case-insensitive"
+        )
+        assert result["nip05"] == "Alice@example.com"
+
 
 class TestProfileCacheExtra:
     """Cover remaining branches: TTL miss, no-pool, update, clear, close,

@@ -192,6 +192,16 @@ class TestValidateConfig:
         config.extra = {"relays": ["wss://relay.example.com"]}
         assert validate_config(config) is True
 
+    def test_is_connected_relays_from_config(self, mock_env, monkeypatch):
+        """is_connected must return True when relays are in config.extra,
+        matching validate_config's logic. Without this, the gateway thinks
+        the adapter is disconnected even though it has valid relay config."""
+        from plugins.platforms.nostr.adapter import is_connected
+        monkeypatch.delenv("NOSTR_RELAYS", raising=False)
+        config = MagicMock()
+        config.extra = {"relays": ["wss://relay.example.com"]}
+        assert is_connected(config) is True
+
 
 class TestSendRouting:
     """Test that send() addresses replies correctly for DMs vs mentions."""
