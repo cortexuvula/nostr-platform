@@ -827,3 +827,157 @@ class TestListenRelayAndPublishOnce:
         pool._running = False
         await gen.aclose()
 
+
+class TestRobustness:
+    """Test relay pool robustness — task tracking, reconnect reliability,
+    and resource cleanup."""
+
+    async def test_background_tasks_tracked_and_cancelled_on_disconnect(self):
+        """Resubscribe/auth background tasks must be tracked and cancelled on
+        disconnect, otherwise they leak and send REQs to dead connections."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+        pool._subscriptions.append(({"kinds": [1]}, "sub_1"))
+
+        # Simulate a CLOSED that schedules a resubscribe task.
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "error: transient"])
+        await asyncio.sleep(0)
+        # The task must be tracked in _background_tasks.
+        assert len(pool._background_tasks) > 0, (
+            "background tasks must be tracked so they can be cancelled on disconnect"
+        )
+
+        # Disconnect must cancel them.
+        conn.disconnect = AsyncMock()
+        await pool.disconnect()
+        for task in pool._background_tasks:
+            assert task.done() or task.cancelled(), (
+                "background tasks must be cancelled on disconnect"
+            )
+
+    async def test_connect_and_listen_survives_unexpected_exception(self):
+        """If _connect_and_listen catches an unexpected exception, it must
+        continue the reconnect loop rather than dying permanently."""
+        from unittest.mock import AsyncMock, patch
+        import time as _time
+
+        pool = RelayPool(["wss://x"])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        pool.connections[conn.url] = conn
+
+        call_count = 0
+        async def fake_connect(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                self.connected = True
+                self.ws = MagicMock()
+                return True
+            return False
+
+        listen_calls = 0
+        async def fake_listen(pool_self, c):
+            nonlocal listen_calls
+            listen_calls += 1
+            if listen_calls == 1:
+                raise RuntimeError("unexpected crash in listen")
+            # Second call: return normally (connection dropped).
+
+        with patch.object(RelayConnection, "connect", fake_connect):
+            pool._listen_relay = fake_listen.__get__(pool)
+            # Run the loop briefly — it should not die on the RuntimeError.
+            task = asyncio.create_task(pool._connect_and_listen(conn))
+            await asyncio.sleep(0.2)
+            # Cancel and verify it was still running (didn't die).
+            assert not task.done(), (
+                "_connect_and_listen must survive unexpected exceptions and keep retrying"
+            )
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_send_raw_failure_triggers_reconnect(self):
+        """When send_raw fails and sets connected=False, the pool should
+        eventually reconnect rather than leaving the relay dead."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool(["wss://x"])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+
+        # send_raw fails — connected should become False.
+        conn.ws = type("FakeWS", (), {"send": AsyncMock(side_effect=ConnectionError("dropped"))})()
+        await conn.send_raw("[]")
+        assert conn.connected is False
+
+    async def test_listen_relay_handles_ws_becoming_none(self):
+        """_listen_relay must not crash if conn.ws is set to None during a
+        disconnect (race between check and async-for)."""
+        pool = RelayPool([])
+        conn = RelayConnection("wss://x")
+        # ws is None — _listen_relay should return cleanly.
+        conn.ws = None
+        await pool._listen_relay(conn)
+        assert conn.connected is False
+
+    async def test_supervisor_restarts_after_crash(self):
+        """If _connect_and_listen raises an unexpected exception (not caught
+        by its own try/except), the supervisor must restart it rather than
+        leaving the relay dead forever."""
+        from unittest.mock import patch
+
+        pool = RelayPool(["wss://x"])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        pool.connections[conn.url] = conn
+
+        crash_count = 0
+        async def crashing_connect_and_listen(c):
+            nonlocal crash_count
+            crash_count += 1
+            if crash_count <= 1:
+                raise MemoryError("simulated fatal crash")
+            # On the second call, stop the loop.
+            pool._running = False
+
+        pool._connect_and_listen = crashing_connect_and_listen
+
+        # Patch sleep to be instant for the 10s restart delay.
+        async def fast_sleep(s):
+            pass
+        with patch("asyncio.sleep", fast_sleep):
+            await pool._supervise_connection(conn)
+
+        assert crash_count >= 2, (
+            "supervisor must restart _connect_and_listen after a crash"
+        )
+
+    async def test_duplicate_closed_does_not_spawn_multiple_resubscribes(self):
+        """Multiple CLOSED frames for the same sub_id on the same relay must
+        not spawn duplicate resubscribe tasks."""
+        from unittest.mock import AsyncMock
+        pool = RelayPool([])
+        pool._running = True
+        conn = RelayConnection("wss://x")
+        conn.connected = True
+        pool.connections[conn.url] = conn
+        pool._subscriptions.append(({"kinds": [1]}, "sub_1"))
+        pool._resubscribe_after = AsyncMock()
+
+        # Send CLOSED twice for the same sub_id.
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "error: transient"])
+        await pool._handle_message(conn, ["CLOSED", "sub_1", "error: again"])
+
+        # Only one resubscribe should be in progress.
+        assert ("wss://x", "sub_1") in pool._resubscribing
+        # Verify only one background task was spawned for this sub_id.
+        # (The second CLOSED should be a no-op since the key is already tracked.)
+

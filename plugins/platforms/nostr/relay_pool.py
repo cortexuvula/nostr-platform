@@ -108,6 +108,14 @@ class RelayPool:
         self._sub_counter = 0
         self._running = False
         self._listen_tasks: list[asyncio.Task] = []
+        # Background tasks (resubscribe, auth) spawned by _handle_message.
+        # Tracked so they can be cancelled on disconnect — otherwise they
+        # leak and send REQs to dead connections.
+        self._background_tasks: set[asyncio.Task] = set()
+        # Tracks (url, sub_id) pairs currently being resubscribed, so a
+        # flapping relay sending multiple CLOSED frames doesn't spawn
+        # duplicate resubscribe loops.
+        self._resubscribing: set[tuple[str, str]] = set()
 
         # Response routing.
         # _pending_ok[event_id] = list of {url: asyncio.Future} groups — each
@@ -137,6 +145,18 @@ class RelayPool:
         cannot authenticate to auth-gated relays (graceful degradation).
         """
         self._signer = signer
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        """Create a tracked background task that is cleaned up on disconnect.
+
+        Resubscribe and auth tasks spawned by _handle_message must be tracked
+        so disconnect() can cancel them — otherwise they leak and send REQs to
+        dead connections. Auto-removes from the set when done (no leak).
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _next_sub_id(self) -> str:
         """Return a process-unique subscription id."""
@@ -191,7 +211,7 @@ class RelayPool:
         self._listen_tasks = []
         for conn in self.connections.values():
             self._listen_tasks.append(
-                asyncio.create_task(self._connect_and_listen(conn))
+                asyncio.create_task(self._supervise_connection(conn))
             )
 
     async def connect_only(self):
@@ -202,6 +222,34 @@ class RelayPool:
             self.connections[url] = conn
             tasks.append(conn.connect())
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _supervise_connection(self, conn: RelayConnection):
+        """Supervise the connect→listen→reconnect loop for one relay.
+
+        Wraps ``_connect_and_listen`` so that if the loop dies with an
+        unexpected error that escapes its own try/except (e.g. a C-level
+        crash or MemoryError), the relay is restarted after a delay rather
+        than staying dead forever.
+        """
+        while self._running:
+            try:
+                await self._connect_and_listen(conn)
+                # Normal exit: _running became False (shutdown).
+                if not self._running:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Connection supervisor for {conn.url} crashed: {e}. "
+                    f"Restarting in 10s."
+                )
+                conn.connected = False
+                conn._reconnect_attempts += 1
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    raise
 
     async def _connect_and_listen(self, conn: RelayConnection):
         """Own the connect → listen → reconnect lifecycle for one relay.
@@ -326,7 +374,7 @@ class RelayPool:
                 if (not accepted and ok_msg.startswith("auth-required:")
                         and not auth_fut and self._signer
                         and conn.challenge and not conn.authenticated):
-                    asyncio.create_task(self._authenticate(conn))
+                    self._spawn_background(self._authenticate(conn))
             logger.debug(f"Relay {conn.url} OK: {message}")
 
         elif msg_type == "AUTH":
@@ -368,7 +416,7 @@ class RelayPool:
             # will likely get CLOSED again, but avoids a hard failure).
             if (msg.startswith("auth-required:") and self._signer
                     and conn.challenge and not conn.authenticated):
-                asyncio.create_task(self._auth_then_resubscribe(conn, sub_id, msg))
+                self._spawn_background(self._auth_then_resubscribe(conn, sub_id, msg))
                 return
 
             # If the relay closed a subscription (e.g. transient error),
@@ -378,9 +426,16 @@ class RelayPool:
             if self._running and sub_id:
                 for f, sid in self._subscriptions:
                     if sid == sub_id:
-                        asyncio.create_task(
-                            self._resubscribe_after(conn, f, sub_id, msg)
-                        )
+                        # Guard against duplicate resubscribe tasks for the
+                        # same sub_id on the same connection (some relays
+                        # send multiple CLOSED frames). If a resubscribe is
+                        # already in progress, skip.
+                        task_key = (conn.url, sub_id)
+                        if task_key not in self._resubscribing:
+                            self._resubscribing.add(task_key)
+                            self._spawn_background(
+                                self._resubscribe_tracked(conn, f, sub_id, msg, task_key)
+                            )
                         break
 
     async def subscribe(self, filters: list[dict]) -> list[str]:
@@ -472,6 +527,15 @@ class RelayPool:
                 except Exception as e:
                     logger.warning(f"Post-auth resubscribe to {conn.url} failed: {e}")
                 break
+
+    async def _resubscribe_tracked(self, conn: RelayConnection,
+                                    filter_dict: dict, sub_id: str,
+                                    reason: str, task_key: tuple):
+        """Wrapper that clears the resubscribe guard on completion."""
+        try:
+            await self._resubscribe_after(conn, filter_dict, sub_id, reason)
+        finally:
+            self._resubscribing.discard(task_key)
 
     async def _resubscribe_after(self, conn: RelayConnection,
                                  filter_dict: dict, sub_id: str,
@@ -717,6 +781,15 @@ class RelayPool:
     async def disconnect(self):
         """Disconnect from all relays."""
         self._running = False
+        # Cancel background tasks (resubscribe, auth) so they don't leak.
+        for task in list(self._background_tasks):
+            task.cancel()
+        for task in list(self._background_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._background_tasks.clear()
         # Stop the per-relay listen/reconnect tasks.
         await self._cancel_listen_tasks()
         for conn in self.connections.values():
